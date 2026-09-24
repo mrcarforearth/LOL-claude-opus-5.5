@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>峡谷对决</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="峡谷对决：浏览器里的 5v5 MOBA，还原召唤师峡谷，玩家对战 AI。非官方同人作品。">
+<meta name="theme-color" content="#010a13">
+<!-- 页面骨架：importmap（Three.js 0.160.0）、字体、DOM 容器；非官方同人作品 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4 58 18v28L32 60 6 46V18z' fill='%230a1428' stroke='%23c8aa6e' stroke-width='4'/%3E%3Cpath d='M20 44 32 14l12 30-12-8z' fill='%230ac8b9'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Marcellus+SC&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;900&display=swap">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="game-root"></div>
+  <div id="ui-root"></div>
+  <div id="screen-root">
+    <div id="boot-splash" class="boot-splash">
+      <div class="boot-title">峡谷对决</div>
+      <div class="boot-sub">正在加载游戏模块…</div>
+      <div class="boot-bar"><i></i></div>
+    </div>
+  </div>
+</div>
+<div id="fan-note" class="fan-note">非官方同人作品 · 所有画面与音效均为程序生成</div>
+<script>
+// 启动守护：模块加载失败或 8 秒内未启动时，在 #screen-root 显示中文提示
+(function () {
+  var shown = false;
+  function show(title, detail) {
+    if (window.__booted && !window.__bootFailed) return;
+    var root = document.getElementById('screen-root');
+    if (!root) return;
+    var box = document.getElementById('boot-error');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'boot-error';
+      box.className = 'boot-error';
+      root.appendChild(box);
+    }
+    shown = true;
+    box.innerHTML = '';
+    var h = document.createElement('div'); h.className = 'boot-error-title'; h.textContent = title;
+    var p = document.createElement('div'); p.className = 'boot-error-detail'; p.textContent = detail || '';
+    var tip = document.createElement('div'); tip.className = 'boot-error-tip';
+    tip.textContent = '请确认通过 http 访问（不要直接双击打开文件），并且可以连接 cdn.jsdelivr.net；然后刷新页面重试。';
+    var btn = document.createElement('button'); btn.className = 'boot-error-btn'; btn.textContent = '刷新重试';
+    btn.onclick = function () { location.reload(); };
+    box.appendChild(h); box.appendChild(p); box.appendChild(tip); box.appendChild(btn);
+  }
+  window.__showBootError = show;
+  window.addEventListener('error', function (e) {
+    if (window.__booted) return;
+    // 只关心脚本错误（字体/样式表加载失败不影响游戏）
+    var tag = e && e.target && e.target.tagName;
+    if (tag && tag !== 'SCRIPT') return;
+    var src = (e && (e.filename || (e.target && e.target.src))) || '';
+    var msg = (e && e.message) || '脚本加载失败';
+    show('游戏模块加载失败', msg + (src ? '（' + src + '）' : ''));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    if (window.__booted) return;
+    var r = e && e.reason;
+    show('游戏模块加载失败', (r && (r.message || String(r))) || '未知错误');
+  });
+  setTimeout(function () {
+    if (!window.__booted && !shown) show('加载超时', '8 秒内游戏模块仍未启动，网络可能较慢或模块加载失败。');
+  }, 8000);
+})();
+</script>
+<script type="module" src="js/main.js" onerror="window.__showBootError &amp;&amp; window.__showBootError('游戏模块加载失败', '无法加载 js/main.js 或其依赖（Three.js CDN）。')"></script>
+</body>
+</html>

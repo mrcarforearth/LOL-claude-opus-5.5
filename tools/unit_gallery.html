@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>单位模型展示</title>
+<!-- 开发用：展示 createUnitView 的全部单位（两队）与动画。参数：?view=all|minions|structures|monsters|epics|misc &anim=cycle|idle|run|attack &quality=high|low &t=秒 -->
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<style>
+  :root { --bg: #0b1016; --fg: #e8dcc0; --muted: #9aa4b0; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.5 "Noto Sans SC", system-ui, sans-serif; overflow: hidden; }
+  #hud { position: fixed; left: 12px; top: 10px; background: rgba(10, 14, 20, .78); border: 1px solid #3a3222; padding: 8px 12px; border-radius: 4px; max-width: calc(100vw - 48px); }
+  #hud b { color: #d8b45e; }
+  #hud a { color: var(--muted); margin-right: 8px; }
+  #stats { color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>单位模型展示</b> ·
+  <a href="?view=all">全部</a><a href="?view=minions">小兵</a><a href="?view=structures">建筑</a><a href="?view=monsters">野怪</a><a href="?view=epics">史诗</a><a href="?view=misc">守卫/残骸</a>
+  · 动画：<a href="#" data-anim="cycle">循环</a><a href="#" data-anim="idle">待机</a><a href="#" data-anim="run">移动</a><a href="#" data-anim="attack">攻击</a><a href="#" data-anim="death">死亡</a>
+  <div id="stats"></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { createUnitView } from '../js/render/models/units.js';
+
+const qs = new URLSearchParams(location.search);
+const VIEW = qs.get('view') || 'all';
+let ANIM = qs.get('anim') || 'cycle';
+const QUALITY = qs.get('quality') === 'low' ? 'low' : 'high';
+
+const webgl = new THREE.WebGLRenderer({ antialias: QUALITY !== 'low' });
+webgl.setPixelRatio(QUALITY === 'low' ? 1 : Math.min(2, devicePixelRatio));
+webgl.setSize(innerWidth, innerHeight);
+webgl.outputColorSpace = THREE.SRGBColorSpace;
+webgl.toneMapping = THREE.ACESFilmicToneMapping;
+webgl.toneMappingExposure = 1.05;
+webgl.shadowMap.enabled = QUALITY !== 'low';
+webgl.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(webgl.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x17202a);
+scene.fog = new THREE.Fog(0x17202a, 6000, 14000);
+scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x2f3d22, 1.15));
+scene.add(new THREE.AmbientLight(0xffffff, 0.12));
+const sun = new THREE.DirectionalLight(0xfff0d8, 2.4);
+sun.position.set(-1800, 3200, 1400);
+sun.castShadow = QUALITY !== 'low';
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -3200, right: 3200, top: 3200, bottom: -3200, near: 100, far: 9000 });
+sun.shadow.bias = -0.0005;
+scene.add(sun); scene.add(sun.target);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(20000, 20000), new THREE.MeshStandardMaterial({ color: 0x4d5a3c, roughness: 0.95 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+const fakeRenderer = { quality: QUALITY, time: 0, fx: null, playerTeam: 0, cameraCtl: null };
+
+// —— 展示实体 ——
+let nid = 1;
+function ent(type, extra = {}) {
+  return { id: nid++, type, team: 0, alive: true, x: 0, y: 0, z: 0, facing: 0, radius: 60, visible: [true, true],
+    anim: { state: 'idle', t: 0, speed: 1, windup: 0.35, attackIndex: 0, slot: null }, modelState: {}, ...extra };
+}
+const rows = [];
+function row(name, list, gap) { rows.push({ name, list, gap }); }
+const M = ['melee', 'caster', 'siege', 'super'];
+if (VIEW === 'all' || VIEW === 'minions') {
+  row('小兵（秩序）', M.map((k) => ent('minion', { kind: k, team: 0 })), 190);
+  row('小兵（混沌）', M.map((k) => ent('minion', { kind: k, team: 1 })), 190);
+  row('男爵强化', M.map((k, i) => ent('minion', { kind: k, team: i % 2, empowered: true })), 190);
+}
+if (VIEW === 'all' || VIEW === 'structures') {
+  row('防御塔（秩序）', ['outer', 'inner', 'inhib', 'nexus'].map((t) => ent('turret', { tier: t, kind: 'turret', team: 0 })).concat([ent('turret', { kind: 'fountainTurret', tier: 'fountain', team: 0 })]), 420);
+  row('防御塔（混沌）', ['outer', 'inner', 'inhib', 'nexus'].map((t) => ent('turret', { tier: t, kind: 'turret', team: 1 })).concat([ent('turret', { kind: 'fountainTurret', tier: 'fountain', team: 1 })]), 420);
+  row('水晶/枢纽', [ent('inhibitor', { team: 0 }), ent('inhibitor', { team: 1 }), ent('nexus', { team: 0 }), ent('nexus', { team: 1 })], 640);
+}
+if (VIEW === 'all' || VIEW === 'monsters') {
+  row('野怪', ['blue_sentinel', 'red_brambleback', 'gromp', 'murkwolf', 'murkwolf_small', 'raptor', 'raptor_small'].map((k) => ent('monster', { kind: k, team: 2 })), 300);
+  row('魔像/河蟹', ['krug_ancient', 'krug', 'krug_split', 'krug_mini', 'scuttle', 'unknown_thing'].map((k) => ent('monster', { kind: k, team: 2 })), 280);
+}
+if (VIEW === 'all' || VIEW === 'epics') {
+  row('元素亚龙', ['infernal', 'mountain', 'ocean', 'cloud'].map((d) => ent('monster', { kind: 'dragon', dragonType: d, team: 2, radius: 170 })).concat([ent('monster', { kind: 'elder_dragon', dragonType: 'elder', team: 2 })]), 720);
+  row('男爵/先锋', [ent('monster', { kind: 'baron', team: 2 }), ent('monster', { kind: 'herald', team: 2, modelState: { eyeOpen: true } }), ent('monster', { kind: 'herald', team: 2 }), ent('monster', { kind: 'herald_ally', team: 0 })], 700);
+}
+if (VIEW === 'all' || VIEW === 'misc') {
+  row('守卫', [ent('ward', { kind: 'stealth', team: 0 }), ent('ward', { kind: 'control', team: 0 }), ent('ward', { kind: 'stealth', team: 1 }), ent('ward', { kind: 'control', team: 1 })], 140);
+  row('残骸/仇恨', [ent('turret', { tier: 'outer', kind: 'turret', team: 0, alive: false }), ent('turret', { tier: 'inner', kind: 'turret', team: 1, alive: false }),
+    ent('inhibitor', { team: 0, alive: false }), ent('nexus', { team: 1, alive: false }),
+    ent('turret', { tier: 'outer', kind: 'turret', team: 1, attackTarget: { type: 'champion', alive: true } })], 560);
+}
+
+const views = [];
+let z = 0; let maxW = 0;
+const rowGap = { '小兵（秩序）': 260, '小兵（混沌）': 260, '男爵强化': 320, '守卫': 220 };
+for (const r of rows) {
+  const w = (r.list.length - 1) * r.gap;
+  maxW = Math.max(maxW, w);
+  r.list.forEach((e, i) => {
+    const v = createUnitView(e, fakeRenderer);
+    const x = -w / 2 + i * r.gap;
+    v.object3d.position.set(x, 0, z);
+    e.facing = -Math.PI / 4;
+    v.object3d.rotation.y = e.facing;
+    scene.add(v.object3d);
+    views.push({ e, v });
+  });
+  z += rowGap[r.name] || Math.max(420, r.gap * 0.9);
+}
+const depth = z;
+
+// —— 镜头（接近游戏俯视角 56°） ——
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 10, 30000);
+const span = Math.max(maxW, depth) + 600;
+let dist = Number(qs.get('dist')) || span * 1.05;
+let yaw = Number(qs.get('yaw')) || 0;
+const pitch = (Number(qs.get('pitch')) || 50) * Math.PI / 180;
+const look = new THREE.Vector3(0, 60, depth / 2 - 200);
+if (qs.get('look')) { const [lx, lz] = qs.get('look').split(',').map(Number); look.set(lx, 60, lz); }
+function placeCam() {
+  camera.position.set(look.x + Math.sin(yaw) * Math.cos(pitch) * dist, look.y + Math.sin(pitch) * dist, look.z + Math.cos(yaw) * Math.cos(pitch) * dist);
+  camera.lookAt(look);
+  sun.target.position.copy(look); sun.position.set(look.x - 1800, 3200, look.z + 1400);
+}
+placeCam();
+let drag = null;
+addEventListener('pointerdown', (ev) => { drag = { x: ev.clientX, y: ev.clientY, yaw }; });
+addEventListener('pointerup', () => { drag = null; });
+addEventListener('pointermove', (ev) => { if (drag) { yaw = drag.yaw - (ev.clientX - drag.x) * 0.005; placeCam(); } });
+addEventListener('wheel', (ev) => { dist = Math.max(300, Math.min(20000, dist * (1 + Math.sign(ev.deltaY) * 0.1))); placeCam(); });
+addEventListener('resize', () => { webgl.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+document.querySelectorAll('[data-anim]').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); ANIM = a.dataset.anim; phaseT = 0; }));
+
+// —— 动画驱动：模拟 entity.anim ——
+const CYCLE = [['idle', 2], ['run', 2.5], ['attack', 2.4], ['idle', 1]];
+let phaseT = 0; let simT = Number(qs.get('t')) || 0;
+function stateAt(t) {
+  if (ANIM !== 'cycle') return ANIM;
+  const total = CYCLE.reduce((s, c) => s + c[1], 0);
+  let k = t % total;
+  for (const [s, d] of CYCLE) { if (k < d) return s; k -= d; }
+  return 'idle';
+}
+function drive(dt) {
+  simT += dt; phaseT += dt;
+  const st = stateAt(simT);
+  for (const { e, v } of views) {
+    const a = e.anim;
+    const isStruct = e.type === 'turret' || e.type === 'inhibitor' || e.type === 'nexus';
+    if (st === 'death') {
+      if (e.alive && !isStruct && phaseT > 0.3) { e.alive = false; v.onDeath?.(e); }
+    } else if (!e.alive && e._revived !== true && !isStruct && e.type !== 'ward') { e.alive = true; v.onRespawn?.(e); }
+    const want = isStruct && st === 'run' ? 'idle' : (st === 'death' ? 'idle' : st);
+    if (a.state !== want) { a.state = want; a.t = 0; }
+    else a.t += dt;
+    if (a.state === 'attack') {
+      const period = 1 / 0.9;
+      if (a.t >= period) { a.t -= period; a.attackIndex++; }
+    }
+    e.stealthed = e.type === 'ward' && e.kind === 'stealth';
+  }
+}
+
+const statsEl = document.getElementById('stats');
+let last = performance.now(); let frames = 0; let acc = 0; let fps = 0;
+window.__gallery = { views, scene, camera, webgl, setAnim: (a) => { ANIM = a; phaseT = 0; }, info: () => ({ calls: webgl.info.render.calls, triangles: webgl.info.render.triangles, fps, units: views.length }) };
+// 预热：按 ?t= 快进
+for (let i = 0; i < Math.min(600, Math.round(simT * 30)); i++) {
+  const dt = 1 / 30; fakeRenderer.time += dt; drive(0); for (const { e, v } of views) v.update(dt, e, fakeRenderer);
+}
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  fakeRenderer.time += dt;
+  drive(dt);
+  for (const { e, v } of views) v.update(dt, e, fakeRenderer);
+  webgl.render(scene, camera);
+  frames++; acc += dt;
+  if (acc > 0.5) { fps = Math.round(frames / acc); frames = 0; acc = 0;
+    statsEl.textContent = `单位 ${views.length} · 动画 ${stateAt(simT)} · draw calls ${webgl.info.render.calls} · 三角面 ${webgl.info.render.triangles} · ${fps} fps · 画质 ${QUALITY}`; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -654,6 +654,22 @@ export function createAI(champ, game, { role, difficulty }) → controller   // 
 - 技能使用：通用逻辑读取每个技能的 `ai` 提示；英雄定义可给 `ai.custom` 完全接管。技能加点按 `def.ai.skillOrder`（R 能点就点）。
 - 难度参数来自 `DIFFICULTY[difficulty]`。
 
+**AI 控制器对象接口**（英雄定义里 `ai.custom(champ, ability, ai, game)` / `ai.when(champ, target, game, ai)` 收到的 `ai`，AI 代理必须实现、英雄代理可以调用）：
+```js
+ai.champ; ai.game; ai.role; ai.params /*DIFFICULTY[...]*/; ai.mode /*'shopping'|'laning'|'jungling'|'fighting'|'retreating'|'recalling'|'pushing'|'objective'|'roaming'|'dead'*/;
+ai.target;                          // 当前集火的敌方单位（Unit|null）
+ai.visibleEnemies(radius = 2000) → Champion[];   // 视野内敌方英雄（按距离升序）
+ai.nearbyAllies(radius = 1500) → Champion[];
+ai.hpPct() → 0..1;
+ai.predict(unit, delay) → { x, y };  // 按目标当前移动方向线性预判（考虑难度精度误差）
+ai.castAt(slot, x, y) → result;      // 包装 champ.castAbility，带反应延迟/精度
+ai.castOn(slot, unit) → result;
+ai.castSelf(slot) → result;
+ai.isUnderEnemyTurret(x, y) → bool;  // 在敌方防御塔射程内
+ai.isSafe(x, y) → bool;              // 粗略安全评估（塔、可见敌人数量）
+```
+英雄代码只应在 `ai.custom`/`ai.when` 中使用这些接口；调用前用可选链保护（`ai?.castAt?.(...)`），以便 AI 未实现时不崩溃。
+
 ## 10. 渲染层
 
 ### 10.1 `Renderer`（`js/render/renderer.js`，core）
@@ -827,3 +843,31 @@ URL 参数：`autostart=1`、`champ=<id>`、`team=0|1`、`speed=<n>`、`difficul
 - 血条：玩家自己绿色、队友蓝色、敌人红色、中立黄色。
 - 页面：单一深色设计（游戏界面），`body` 明确背景色；桌面优先，窄屏（<900px）在选人界面提示「建议使用桌面端键鼠游玩」但仍可观战模式运行。
 - 不使用任何 Riot 官方 Logo/美术素材；页面标注「非官方同人作品」。
+
+---
+
+## 附录 A：第一阶段已实现的扩展 API（core-sim / map 实际代码，所有后续代理可直接使用）
+
+**以代码为准**：写代码前请阅读相关实现文件（`js/core/*.js`、`js/world/*.js`、`js/champions/garen.js`、`js/champions/_common.js`），下面只是索引。
+
+### A.1 core 扩展
+- `game.after(seconds, fn)` 模拟时间延迟回调（返回可 `cancel()` 的句柄）；`_common.delay` 基于它。
+- `unit.setPosition(x, y)`（吸附可走格）、`removeCC(type)`、`ccRemaining(type)`、`getCC(type)`、`isHardCCd()`、`canDash()`、`playCastAnim(slot, dur)`、`buffStacks(id)`、`unit.moving`（本 tick 是否移动）。
+- 钩子 `beforeDeath(ctx: { killer, cancel })` — 设 `ctx.cancel = true` 阻止死亡（生命保留 ≥1），守护天使等用。
+- `champion.setLevel(n)`、`isRecalling`、`respawnRemaining`、`recallDuration()`、`displayName`、`slotIndex`、`jungleCs`、`wardsKilled`、`largestMultiKill`、`lastChampionDamager` / `lastChampionDamageAt`（呼叫支援用）、`shopSession`（每次离开泉水 +1，撤销购买判定）。
+- Buff 扩展字段：`disableAttack`、`ghosted`、`persistOnDeath`（死亡保留，龙魂等用）/ `removeOnDeath`、`onRefresh(unit, buff)`、`data.recallTime`（缩短回城时间，男爵 Buff 用：`data.recallTime = 4`）。Buff 实例方法：`remove()`、`setDuration()`、`addStacks(n)`，属性 `elapsed`、`progress`。
+- 属性扩展键：`damageDealtReduction`（造成伤害降低，虚弱）、`slowResist`、`hpPct`；`unit.stats` 额外有 `baseHp、bonusHp、baseArmor、baseMr、slow`。
+- AbilityDef 扩展：`onCastStart(champ, ctx)`（前摇开始时）、`onRankUp`、`keepChannel`、`maxCharges` / `chargeLockout`（充能技能）。AbilityState 额外：`expireRecast()`、`recastRemaining`、`baseCooldown()`、`cooldownFor()`、`reduceCooldownPct()`。超出射程的指向技能返回 `{ ok: true, reason: 'queued' }`。
+- 召唤师技能扩展：`usableWhileCC`、`canTarget(champ, t)`、`maxCharges/rechargeTime`；`SummonerState.consume()`。传送为 point 目标：自动选目标点 1200 内的友方防御塔/小兵/守卫，也接受 `ctx.target`。
+- 装备相关：`consumable.use(champ, itemState, ctx)` 第 3 个参数 ctx（控制守卫取放置点）；`consumable.keepWhenEmpty: true`（可充值药水用完留在栏位）；叠放消耗品用 `itemState.stacks`。`champion.useItem` 移除物品后调用 `game.recomputeItemStats`（main.js 需设置 `game.recomputeItemStats = recomputeItemStats`）。
+- 建筑：`blocksUnits = true` 时软碰撞把单位推出建筑半径；建筑 `die()` 应调用 `game.onUnitDeath(this, killer)`，不要 `game.remove`；野怪自行结算奖励时设 `customRewards = true`；core 使用 `monster.epic`（经验给击杀方全队）、`large`（惩戒回血）、`csValue`。
+- 事件：新增 `abilityLevelUp { champion, slot, rank }`；`attackHit` 致盲落空时带 `miss: true`。`game.end` 发 `announce('victory', …, { team: winner })`，UI/音频按玩家队伍换算胜利/失败（core 不发 'defeat'）。多杀与终结同时发生时连续发两条 announce。
+- 测试工具：`helpers.makeGame({ open: true | { walls, brushes }, waves: false })` 使用开阔场地 OpenNav + 全图视野 AllVision，适合与地图无关的单元测试；`spawnDummy` 支持 `type: champion/minion/monster`。sim.mjs 按分路分配召唤师技能：jungle flash+smite、top flash+teleport、mid flash+ignite、adc flash+heal、support flash+exhaust。
+- `_common.js` 可复用：`skillshot / aoeDamage / coneDamage / lineDamage / scaleText / scaled / rv / fmt / pct / predictPosition / delay` 等。
+
+### A.2 map 扩展
+- 建筑 id：`b_top_inhib` 是**高地塔**（kind turret, tier inhib），召唤水晶是 `b_top_inhibitor`（kind inhibitor）。**各模块按 kind/lane/tier 判断，不要依赖 id。** `STRUCTURE_FOOTPRINT = { turret: 90, inhibitor: 150, nexus: 230, fountainTurret: 110 }`。
+- `mapdata` 额外导出：`CENTER`、`mirrorPoint(x,y)`、`LANE_CENTERLINES`、`BASE_BOUNDARY`、`isInRiver`、`riverDistance`、`pointInPoly`。`FOUNTAINS[].platformRadius = 900`。`CAMPS[]` 额外：`name、facing、monsters[].facing、pit、path（迅捷蟹巡游点）、despawnAt（先锋 1185）`；side 0 = 蓝方半场，1 = 红方半场，2 = 中立。`BRUSHES[]`：`{ id(=下标), kind, side, name, poly }`，共 50 个。`RIVER.width` 为典型半宽 600，逐点半宽在 `RIVER.halfWidths`。`WALK.corridors[].w` 为**全宽**，另有 `areas / edgeNoise / keepWalkable`。
+- `DECOR`（给地形）：`bases[]{ team, theme, boundary, platformHeight, plaza, nexus, fountain{x,y,r,pool}, gates[{lane,a,b,x,y,dirX,dirY,width}], walls }`、`lanePaths`（兵线石板路中心线，宽 620）、`jungleTrails`（46 条）、`riverFord`（中路浅滩）、`riverRocks`（28）、`campAreas`（12）、`pits`（含 mouth/depth/rim）、`props`（statue/brazier/crystalPillar/lantern，含 team/facing/scale）。
+- NavGrid 额外：`terrain`（纯地形可走，不含建筑占地——**小地图与地形渲染请用它**）、`clearance`、`comp/componentAt`、`isTerrainWalkable`、`sdfAt`、`hasClearLine`、静态 `NavGrid.pathLength`。sdf 只由地形计算（墙内正、可走负），建筑占地不产生隆起。`blocksSight` 只看地形墙。
+- Vision 额外：`los[team]`（仅视线不含草丛规则）、`version`（每次重算 +1，fogrender 据此判断是否上传纹理）、`recompute()`、`invalidate()`、`teamSeesBrush(team,id)`、`sources`、`lastUpdateMs`；`addRevealer({ team, x, y, radius, duration, follow, trueSight, seeBrush }) → { remove() }`（迅捷蟹视野、艾希 E 鹰击长空等）。`grids` 下标 = `floor(y/100)*150 + floor(x/100)`（y 从南往北）。野怪不提供视野；`stealthed` 实体只有真视可见。

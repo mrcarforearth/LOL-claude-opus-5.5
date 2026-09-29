@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>英雄模型展示</title>
+<!-- 开发用：展示 createChampionView 的全部英雄 + 提伯斯（两排）与动画、右侧为 renderChampionPortrait 头像。
+     参数：?anim=cycle|idle|run|attack|cast|recall|dash|airborne|stunned|death|special  &t=快进秒数  &dist=镜头距离  &pitch=俯仰角  &yaw=偏航
+           &only=garen,ahri（只看指定英雄） &quality=low -->
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<style>
+  :root { --bg: #0b1016; --fg: #e8dcc0; --muted: #9aa4b0; --gold: #c8aa6e; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.5 "Noto Sans SC", system-ui, sans-serif; overflow: hidden; }
+  #hud { position: fixed; left: 12px; top: 10px; background: rgba(10, 14, 20, .78); border: 1px solid #3a3222; padding: 6px 10px; border-radius: 4px; max-width: calc(100vw - 260px); }
+  #hud b { color: var(--gold); }
+  #hud a { color: var(--muted); margin-right: 6px; }
+  #stats { color: var(--muted); }
+  #ports { position: fixed; right: 8px; top: 8px; bottom: 8px; width: 214px; display: grid; grid-template-columns: repeat(3, 68px); gap: 4px; align-content: start; }
+  #ports figure { margin: 0; text-align: center; font-size: 11px; color: var(--muted); }
+  #ports img, #ports .ph { width: 68px; height: 68px; display: block; border: 1px solid var(--gold); background: #111; box-sizing: border-box; }
+  .lbl { position: fixed; transform: translate(-50%, 0); font-size: 12px; color: var(--fg); text-shadow: 0 1px 2px #000; pointer-events: none; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>英雄模型展示</b> · 动画：
+  <a href="?anim=cycle">循环</a><a href="?anim=idle">待机</a><a href="?anim=run">跑动</a><a href="?anim=attack">普攻</a><a href="?anim=cast">施法</a>
+  <a href="?anim=recall">回城</a><a href="?anim=dash">冲刺</a><a href="?anim=airborne">击飞</a><a href="?anim=stunned">眩晕</a><a href="?anim=death">死亡</a><a href="?anim=special">特殊状态</a>
+  <div id="stats"></div>
+</div>
+<div id="ports"></div>
+<script type="module">
+import * as THREE from 'three';
+import { createChampionView, renderChampionPortrait, modelStats, MODELS } from '../js/render/models/champions.js';
+import { CHAMPIONS } from '../js/champions/index.js';
+
+const qs = new URLSearchParams(location.search);
+let ANIM = qs.get('anim') || 'cycle';
+const QUALITY = qs.get('quality') === 'low' ? 'low' : 'high';
+const ROW1 = ['garen', 'darius', 'leesin', 'masteryi', 'ahri', 'lux', 'annie', 'tibbers'];
+const ROW2 = ['ashe', 'jinx', 'thresh', 'yasuo', 'ezreal', 'malphite', 'zed', 'zed_shadow', 'morgana', 'xinzhao'];
+const only = qs.get('only') ? qs.get('only').split(',') : null;
+const rows = only ? [only] : [ROW1, ROW2];
+
+const webgl = new THREE.WebGLRenderer({ antialias: QUALITY !== 'low' });
+webgl.setPixelRatio(QUALITY === 'low' ? 1 : Math.min(2, devicePixelRatio));
+webgl.setSize(innerWidth, innerHeight);
+webgl.outputColorSpace = THREE.SRGBColorSpace;
+webgl.toneMapping = THREE.ACESFilmicToneMapping;
+webgl.toneMappingExposure = 1.05;
+webgl.shadowMap.enabled = QUALITY !== 'low';
+webgl.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(webgl.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a2530);
+scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x2f3d22, 1.15));
+scene.add(new THREE.AmbientLight(0xffffff, 0.12));
+const sun = new THREE.DirectionalLight(0xfff0d8, 2.4);
+sun.castShadow = QUALITY !== 'low';
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -2000, right: 2000, top: 2000, bottom: -2000, near: 100, far: 9000 });
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 2.5;
+scene.add(sun, sun.target);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(20000, 20000), new THREE.MeshStandardMaterial({ color: 0x55683f, roughness: 0.95 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+const fakeRenderer = { quality: QUALITY, time: 0, fx: null, playerTeam: 0, cameraCtl: null };
+let nid = 1;
+const views = [];
+const GAP = 250, ROWGAP = 380;
+rows.forEach((list, ri) => {
+  const w = (list.length - 1) * GAP;
+  list.forEach((id, i) => {
+    const pet = id === 'tibbers';
+    const e = { id: nid++, type: pet ? 'pet' : 'champion', championId: pet ? undefined : id, modelId: id, def: CHAMPIONS[id], team: 0, alive: true,
+      x: 0, y: 0, z: 0, facing: 0, radius: 65, visible: [true, true], modelState: {},
+      anim: { state: 'idle', t: 0, speed: 1, windup: 0.3, attackIndex: 0, slot: null } };
+    const v = createChampionView(e, fakeRenderer);
+    // 第一排（本批专属模型）在前，第二排在后并错开半格
+    v.object3d.position.set(-w / 2 + i * GAP + (ri % 2) * GAP * 0.5, 0, (rows.length - 1 - ri) * ROWGAP);
+    v.object3d.rotation.y = -Math.PI / 2 + 0.55;     // 正前方 +X 转向镜头（+Z）略侧
+    scene.add(v.object3d);
+    const lbl = document.createElement('div');
+    lbl.className = 'lbl';
+    lbl.textContent = (id === 'zed_shadow' ? '影分身' : CHAMPIONS[id]?.name || id) + (MODELS[id] ? '' : '（通用）');
+    document.body.appendChild(lbl);
+    views.push({ id, e, v, lbl });
+  });
+});
+
+// —— 镜头 ——
+const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight, 10, 30000);
+const maxW = Math.max(...rows.map((r) => r.length)) * GAP;
+// 让前排宽度正好填满头像栏左侧的区域
+const viewW = Math.max(400, innerWidth - 240);
+const hfov = 2 * Math.atan(Math.tan(15 * Math.PI / 180) * innerWidth / innerHeight);
+let dist = Number(qs.get('dist')) || ((rows[0].length * GAP) / 2) / Math.tan(hfov / 2) * (innerWidth / viewW) * 1.02;
+let yaw = Number(qs.get('yaw')) || 0;
+const pitch = (Number(qs.get('pitch')) || 14) * Math.PI / 180;
+// 注视点：前排中心，向右偏移使画面中心落在头像栏左侧
+const look = new THREE.Vector3(0, 125, (rows.length - 1) * ROWGAP);
+const shiftPx = (innerWidth - viewW) / 2;
+function placeCam() {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  camera.position.set(look.x + Math.sin(yaw) * Math.cos(pitch) * dist, look.y + Math.sin(pitch) * dist, look.z + Math.cos(yaw) * Math.cos(pitch) * dist);
+  camera.lookAt(look);
+  camera.setViewOffset(innerWidth, innerHeight, shiftPx, -innerHeight * 0.06, innerWidth, innerHeight);
+  sun.target.position.copy(look); sun.position.set(look.x - 1800, 3200, look.z + 1400);
+}
+placeCam();
+let drag = null;
+addEventListener('pointerdown', (ev) => { drag = { x: ev.clientX, yaw }; });
+addEventListener('pointerup', () => { drag = null; });
+addEventListener('pointermove', (ev) => { if (drag) { yaw = drag.yaw - (ev.clientX - drag.x) * 0.005; placeCam(); } });
+addEventListener('wheel', (ev) => { dist = Math.max(200, Math.min(20000, dist * (1 + Math.sign(ev.deltaY) * 0.1))); placeCam(); });
+addEventListener('resize', () => { webgl.setSize(innerWidth, innerHeight); placeCam(); });
+
+// —— 动画驱动：模拟 core 的 entity.anim / modelState ——
+const CYCLE = [['idle', 2], ['run', 2], ['attack', 2.7], ['cast', 3.2], ['special', 2.5], ['recall', 1.6], ['dash', 0.8], ['airborne', 1.2], ['stunned', 1.2], ['death', 2.2]];
+const SPECIAL = { garen: { spinning: true, swordGlow: true }, darius: { axeSpin: true, axeGlow: true }, leesin: { ironWill: true }, masteryi: { highlander: true },
+  ahri: { spiritRush: true }, lux: { finalSpark: true }, annie: { tibbersOut: true, pyroReady: true }, jinx: { weapon: 'rocket', excited: true }, thresh: { lanternOut: true }, ashe: { focus: true },
+  yasuo: { tornadoReady: true, qStacks: 2, flowFull: true }, ezreal: { ezrealRCharge: true, ezrealStacks: 5 }, malphite: { malphiteShield: true, malphiteThunder: true },
+  zed: { deathMark: true, shadowCount: 1 }, morgana: { morganaChains: true }, xinzhao: { threeTalon: true, crescentGuard: true, determination: 2 } };
+let simT = Number(qs.get('t')) || 0, stT = 0, lastSt = null;
+function stateAt(t) {
+  if (ANIM !== 'cycle') return ANIM;
+  const total = CYCLE.reduce((s, c) => s + c[1], 0);
+  let k = t % total;
+  for (const [s, d] of CYCLE) { if (k < d) return s; k -= d; }
+  return 'idle';
+}
+function drive(dt) {
+  simT += dt;
+  const st = stateAt(simT);
+  if (st !== lastSt) { lastSt = st; stT = 0; } else stT += dt;
+  for (const { id, e, v } of views) {
+    const a = e.anim;
+    if (st === 'death') { if (e.alive && stT > 0.1) { e.alive = false; v.onDeath?.(e); } }
+    else if (!e.alive) { e.alive = true; v.onRespawn?.(e); }
+    e.modelState = st === 'special' ? (SPECIAL[id] || {}) : {};
+    let want = st === 'special' ? 'idle' : st;
+    if (want === 'cast') {
+      const slot = ['Q', 'W', 'E', 'R'][Math.floor(stT / 0.8) % 4];
+      if (a.slot !== slot) { a.slot = slot; a.state = 'cast'; a.t = 0; }
+    }
+    if (a.state !== want) { a.state = want; a.t = 0; } else a.t += dt;
+    if (a.state === 'attack') { a.windup = 0.32; if (a.t >= 0.9) { a.t -= 0.9; a.attackIndex++; } }
+    if (a.state === 'airborne') e.z = Math.max(0, Math.sin(Math.min(1, a.t / 1) * Math.PI) * 90); else e.z = 0;
+  }
+}
+
+// —— 头像 ——
+const ports = document.getElementById('ports');
+const portT0 = performance.now();
+let portDone = 0, portFail = 0;
+for (const id of [...ROW1, ...ROW2]) {
+  const f = document.createElement('figure');
+  const ph = document.createElement('div'); ph.className = 'ph';
+  const cap = document.createElement('figcaption'); cap.textContent = CHAMPIONS[id]?.name || id;
+  f.append(ph, cap); ports.appendChild(f);
+  renderChampionPortrait(id, 128).then((url) => {
+    portDone++;
+    if (!url) { portFail++; return; }
+    const img = new Image(); img.src = url; f.replaceChild(img, ph);
+  });
+}
+
+const statsEl = document.getElementById('stats');
+let last = performance.now(), frames = 0, acc = 0, fps = 0;
+const tmp = new THREE.Vector3();
+window.__gallery = {
+  views, scene, camera, webgl, setAnim: (s) => { ANIM = s; },
+  info: () => ({ calls: webgl.info.render.calls, triangles: webgl.info.render.triangles, fps, champs: views.length, portraits: portDone, portraitFail: portFail, portraitMs: Math.round(performance.now() - portT0), models: modelStats() }),
+};
+for (let i = 0; i < Math.min(900, Math.round(simT * 30)); i++) { const dt = 1 / 30; simT -= 0; drive(0); for (const { e, v } of views) v.update(dt, e, fakeRenderer); }
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  fakeRenderer.time += dt;
+  drive(dt);
+  for (const { e, v } of views) v.update(dt, e, fakeRenderer);
+  webgl.render(scene, camera);
+  for (const { v, lbl } of views) {
+    tmp.copy(v.object3d.position); tmp.y -= 18; tmp.project(camera);
+    lbl.style.left = `${(tmp.x + 1) * 0.5 * innerWidth}px`; lbl.style.top = `${(1 - tmp.y) * 0.5 * innerHeight}px`;
+  }
+  frames++; acc += dt;
+  if (acc > 0.5) {
+    fps = Math.round(frames / acc); frames = 0; acc = 0;
+    statsEl.textContent = `英雄 ${views.length} · 动画 ${stateAt(simT)} · draw calls ${webgl.info.render.calls} · 三角面 ${webgl.info.render.triangles} · ${fps} fps · 头像 ${portDone}/${ROW1.length + ROW2.length}`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

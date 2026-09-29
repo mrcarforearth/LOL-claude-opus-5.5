@@ -44,7 +44,7 @@ export class Menu {
     const body = h('div.menu-body', ...Object.values(this.pages));
     this.el = h('div.menu-win', { role: 'dialog', 'aria-label': '游戏菜单', 'aria-modal': 'true' },
       h('i.hx-c.tl'), h('i.hx-c.tr'), h('i.hx-c.bl'), h('i.hx-c.br'),
-      h('header.menu-head', h('div.panel-title', '游戏菜单'), h('div.menu-paused', '游戏已暂停')),
+      h('header.menu-head', h('div.panel-title', '游戏菜单'), h('div.menu-paused', ui.config?.lan ? '局域网对战 · 游戏不会暂停' : '游戏已暂停')),
       h('div.menu-main', nav, body));
     this.el.addEventListener('pointerdown', (e) => e.stopPropagation());
     this.wrap = h('div.menu-layer', this.el);
@@ -133,14 +133,17 @@ export class Menu {
     ok.addEventListener('click', () => {
       const g = this.ui.game;
       this.hide();
-      if (!g.over) g.end?.(1 - this.ui.team);
+      if (g.over) return;
+      // 局域网：投降作为命令发送（同队真人全部同意后在所有客户端同一 tick 结束对局）
+      if (typeof this.ui.opts?.onSurrender === 'function') this.ui.opts.onSurrender();
+      else g.end?.(1 - this.ui.team);
     });
     const cancel = h('button.hex-btn', { type: 'button' }, h('span', '取消'));
     cancel.addEventListener('click', () => this.setPage('settings'));
     return h('section.menu-page.surrender',
       h('div.sur-icon'),
       h('div.sur-title', spect ? '结束观战？' : '确定要投降吗？'),
-      h('div.sur-desc', spect ? '本局将立即结束，并按你所在队伍失败结算。' : '投降后本局立即结束，你的队伍将被判定为失败。'),
+      h('div.sur-desc', spect ? '本局将立即结束，并按你所在队伍失败结算。' : this.ui.config?.lan ? '发起投降投票：同队所有真人玩家都同意后，你的队伍将被判定为失败。' : '投降后本局立即结束，你的队伍将被判定为失败。'),
       h('div.sur-actions', cancel, ok));
   }
   setPage(id) {
@@ -157,8 +160,9 @@ export class Menu {
     this.setPage(page);
     toggle(this.wrap, 'on', true);
     const g = this.ui.game;
-    this.pausedByMenu = !g.paused;
-    g.paused = true;
+    // 局域网对战不暂停（所有客户端必须同步推进）
+    this.pausedByMenu = !this.ui.config?.lan && !g.paused;
+    if (this.pausedByMenu) g.paused = true;
     this.ui.setModal('menu', true);
     requestAnimationFrame(() => this.el.querySelector('.menu-nav-btn.resume')?.focus({ preventScroll: true }));
   }

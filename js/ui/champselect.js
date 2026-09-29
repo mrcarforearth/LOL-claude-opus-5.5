@@ -5,6 +5,7 @@ import {
 import { iconURL } from './icons.js';
 import { Tooltip, tipCard } from './tooltip.js';
 import { SUMMONERS as CORE_SUMMONERS } from '../core/summoners.js';
+import { assignLineup, defaultRole, isRole } from '../net/roles.js';
 
 const SELECT_KEY = 'riftclash.select.v1';
 export const UI_SETTINGS_KEY = 'riftclash.ui.v1';
@@ -43,36 +44,29 @@ function shuffle(a) {
   return a;
 }
 
-// —— 阵容：玩家在所选阵营的主分路，其余 9 人按分路随机分配（10 人不重复） ——
-export function buildLineup(champions, playerId, team, playerSummoners, difficulty) {
-  const ids = Object.keys(champions);
-  const used = new Set([playerId]);
-  const pRole = ROLE_ORDER.includes(champions[playerId]?.roles?.[0]) ? champions[playerId].roles[0] : 'mid';
-  const teams = [new Array(5).fill(null), new Array(5).fill(null)];
-  const pIdx = ROLE_ORDER.indexOf(pRole);
-  teams[team][pIdx] = { championId: playerId, role: pRole, isPlayer: true, summoners: playerSummoners.slice(), name: PLAYER_NAME };
-  const slots = [];
-  for (let t = 0; t < 2; t++) for (let i = 0; i < 5; i++) if (!teams[t][i]) slots.push([t, i]);
-  shuffle(slots);
-  const names = shuffle(AI_NAMES.slice());
-  const passes = [
-    (id, role) => champions[id].roles?.[0] === role,
-    (id, role) => (champions[id].roles || []).includes(role),
-    () => true,
-  ];
-  for (const pass of passes) {
-    for (const [t, i] of slots) {
-      if (teams[t][i]) continue;
-      const role = ROLE_ORDER[i];
-      let cand = ids.filter((id) => !used.has(id) && pass(id, role));
-      if (!cand.length && pass === passes[2]) cand = ids.slice();   // 英雄不足 10 个时允许重复
-      if (!cand.length) continue;
-      const id = cand[Math.floor(Math.random() * cand.length)];
-      used.add(id);
-      teams[t][i] = { championId: id, role, isPlayer: false, summoners: ROLE_SUMMONERS[role].slice(), name: names.pop() || `电脑 · ${DIFF_LABELS[difficulty] || '一般'}` };
-    }
-  }
-  return { blue: teams[0], red: teams[1] };
+// —— 阵容：玩家在所选阵营的所选位置，其余 9 人按位置随机分配（10 人不重复；分配逻辑见 js/net/roles.js） ——
+export function buildLineup(champions, playerId, team, playerSummoners, difficulty, role) {
+  const pRole = isRole(role) ? role : defaultRole(champions[playerId]);
+  return assignLineup({
+    champions, difficulty, rng: Math.random, aiNames: shuffle(AI_NAMES.slice()),
+    humans: [{ team, role: pRole, championId: playerId, summoners: playerSummoners, name: PLAYER_NAME, isPlayer: true }],
+  });
+}
+
+// 检测局域网服务（server.mjs 提供 /api/lan）；返回服务信息或 null
+export async function probeLan(timeoutMs = 1500) {
+  if (typeof fetch !== 'function' || !/^https?:$/.test(location.protocol)) return null;
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = setTimeout(() => ctl?.abort(), timeoutMs);
+  try {
+    // 先用 HEAD 请求当前页面：只有 server.mjs 会带 X-Rift-Lan 头（普通静态服务器上不会请求 /api/lan，避免 404 报错）
+    const head = await fetch(location.pathname || '/index.html', { method: 'HEAD', cache: 'no-store', signal: ctl?.signal });
+    if (head.headers.get('x-rift-lan') !== '1') return null;
+    const r = await fetch('/api/lan', { cache: 'no-store', signal: ctl?.signal });
+    if (!r.ok) return null;
+    const info = await r.json();
+    return info && info.lan ? info : null;
+  } catch { return null; } finally { clearTimeout(timer); }
 }
 
 // —— 选人界面 ——
@@ -93,11 +87,15 @@ export async function showChampSelect(root, { champions, summoners, renderPortra
     spectate: !!(defaults.spectate || saved.spectate),
     quality: pick(uiSaved.quality, (v) => QUALITIES.some((q) => q[0] === v), 'high'),
     summoners: null, role: 'all', skill: 'P', spellSlot: null,
+    pos: null, posManual: false,   // 位置（上单/打野/中单/ADC/辅助）；未手动选择时跟随英雄主位置
   };
   if (defaults.difficulty && DIFF_LABELS[defaults.difficulty] && defaults.difficulty !== 'normal') st.difficulty = defaults.difficulty;
-  const defaultSpells = (id) => (ROLE_SUMMONERS[CH[id]?.roles?.[0]] || ['flash', 'ignite']).filter((s) => SP[s]);
+  const defaultSpells = (id, pos) => (ROLE_SUMMONERS[pos || CH[id]?.roles?.[0]] || ['flash', 'ignite']).filter((s) => SP[s]);
+  if (isRole(defaults.role)) { st.pos = defaults.role; st.posManual = true; }
+  else if (isRole(saved.pos) && saved.posManual) { st.pos = saved.pos; st.posManual = true; }
+  else st.pos = defaultRole(CH[st.championId]);
   st.summoners = Array.isArray(saved.summoners) && saved.summoners.length === 2 && saved.summoners.every((s) => SP[s]) && saved.summoners[0] !== saved.summoners[1]
-    ? saved.summoners.slice() : defaultSpells(st.championId);
+    ? saved.summoners.slice() : defaultSpells(st.championId, st.pos);
   if (st.summoners.length < 2) st.summoners = spellIds.slice(0, 2);
 
   const store = new PortraitStore(renderPortrait, CH);
@@ -188,15 +186,35 @@ export async function showChampSelect(root, { champions, summoners, renderPortra
     const startBtn = h('button.cs-start.hex-btn.primary', { type: 'button' }, h('span', '开始游戏'));
     startBtn.addEventListener('click', () => start());
     const spectNote = h('div.cs-note');
+    // 局域网对战入口：仅当页面由 server.mjs 提供（/api/lan 可访问）时可用
+    const lanBtn = h('button.cs-lan.hex-btn', { type: 'button', disabled: true }, h('span', '局域网对战'));
+    const lanNote = h('div.cs-note.cs-lan-note', '');
+    lanBtn.addEventListener('click', () => start(true));
+    probeLan().then((info) => {
+      if (done) return;
+      if (info) { lanBtn.disabled = false; lanBtn.title = '与同一局域网的朋友组队对战，空位由人机补齐'; }
+      else { lanBtn.title = '请用 node server.mjs 启动服务'; lanNote.textContent = '局域网对战：请用 node server.mjs 启动服务'; }
+    });
+    const posSeg = seg('位置', ROLE_ORDER.map((r) => [r, r === 'adc' ? 'ADC' : ROLE_LABELS[r]]), () => st.pos, (v) => {
+      if (st.pos !== v) {
+        st.pos = v; st.posManual = true;
+        const sp = defaultSpells(st.championId, v);
+        if (sp.length === 2) { st.summoners = sp; refreshSpells(); }
+      }
+    });
+    posSeg.title = '人机会自动补齐其余位置（每队上/野/中/ADC/辅助各 1 人）';
     right.append(
+      posSeg,
       h('div.cs-block', h('div.cs-sec-title', '召唤师技能'), spellSlots, spellPicker, h('div.cs-note', '点击 D / F 栏位后，从下方选择要替换的召唤师技能。')),
       seg('阵营', [[0, '蓝色方', 'blue'], [1, '红色方', 'red']], () => st.team, (v) => { st.team = v; }),
       seg('难度', [['easy', '新手'], ['normal', '一般'], ['hard', '困难']], () => st.difficulty, (v) => { st.difficulty = v; }),
-      seg('游戏倍速', SPEEDS.map((s) => [s, `${s}x`]), () => st.speed, (v) => { st.speed = v; }),
-      seg('画质', QUALITIES.map(([v, t]) => [v, t]), () => st.quality, (v) => { st.quality = v; }),
+      h('div.cs-row2',
+        seg('游戏倍速', SPEEDS.map((s) => [s, `${s}x`]), () => st.speed, (v) => { st.speed = v; }),
+        seg('画质', QUALITIES.map(([v, t]) => [v, t]), () => st.quality, (v) => { st.quality = v; })),
       h('div.cs-block', h('label.cs-switch', { for: 'cs-spectate' }, spectBox, h('span.cs-switch-ui'), h('span', '观战模式')), spectNote),
       h('div.cs-grow'),
-      startBtn,
+      h('div.cs-start-row', startBtn, lanBtn),
+      lanNote,
     );
     el.appendChild(h('footer.cs-foot', '非官方同人作品 · 所有画面、模型与音效均为程序生成 · 与 Riot Games 无关'));
 
@@ -268,8 +286,10 @@ export async function showChampSelect(root, { champions, summoners, renderPortra
         skillsEl.appendChild(b);
       }
       if (changed && userAction) {
-        st.summoners = defaultSpells(id).length === 2 ? defaultSpells(id) : st.summoners;
+        if (!st.posManual) st.pos = defaultRole(def);
+        st.summoners = defaultSpells(id, st.pos).length === 2 ? defaultSpells(id, st.pos) : st.summoners;
         refreshSpells();
+        refreshSettings();
         el.classList.remove('pulse'); void el.offsetWidth; el.classList.add('pulse');
       }
       st.skill = 'P';
@@ -306,20 +326,27 @@ export async function showChampSelect(root, { champions, summoners, renderPortra
     };
     window.addEventListener('keydown', onKey);
     let done = false;
-    function start() {
+    function start(lan = false) {
       if (done) return;
       done = true;
       window.removeEventListener('keydown', onKey);
-      saveJSON(SELECT_KEY, { championId: st.championId, summoners: st.summoners, team: st.team, difficulty: st.difficulty, speed: st.speed, spectate: st.spectate });
+      saveJSON(SELECT_KEY, { championId: st.championId, summoners: st.summoners, team: st.team, difficulty: st.difficulty, speed: st.speed, spectate: st.spectate, pos: st.pos, posManual: st.posManual });
       const ui = loadJSON(UI_SETTINGS_KEY, {});
       saveJSON(UI_SETTINGS_KEY, { ...ui, quality: st.quality });
-      const lineup = buildLineup(CH, st.championId, st.team, st.summoners, st.difficulty);
-      const config = {
-        championId: st.championId, summoners: st.summoners.slice(), team: st.team, difficulty: st.difficulty, speed: st.speed,
-        spectate: st.spectate, autopilot: st.spectate, quality: st.quality, blue: lineup.blue, red: lineup.red,
-      };
+      let config;
+      if (lan) {
+        // 局域网：交给 main.js 进入大厅（初始英雄/位置/召唤师技能沿用当前选择）
+        config = { lan: true, championId: st.championId, role: st.pos, summoners: st.summoners.slice(), team: st.team, quality: st.quality };
+      } else {
+        const lineup = buildLineup(CH, st.championId, st.team, st.summoners, st.difficulty, st.pos);
+        config = {
+          championId: st.championId, role: st.pos, summoners: st.summoners.slice(), team: st.team, difficulty: st.difficulty, speed: st.speed,
+          spectate: st.spectate, autopilot: st.spectate, quality: st.quality, blue: lineup.blue, red: lineup.red,
+        };
+      }
       el.classList.add('leaving');
       startBtn.disabled = true;
+      lanBtn.disabled = true;
       setTimeout(() => { tip.dispose(); el.remove(); resolve(config); }, 380);
     }
 
@@ -341,7 +368,9 @@ export function showLoadingScreen(root, config, champions, renderPortrait) {
   const diffText = DIFF_LABELS[config?.difficulty] || '一般';
   el.append(h('div.ld-bg'), h('div.ld-head',
     h('div.ld-map', '召唤师峡谷'),
-    h('div.ld-mode', `5v5 · 人机对战 · 难度：${diffText}${config?.spectate ? ' · 观战模式' : ''}`)));
+    h('div.ld-mode', `5v5 · ${config?.lan ? '局域网对战' : '人机对战'} · 难度：${diffText}${config?.spectate ? ' · 观战模式' : ''}`)));
+  const localId = config?.lan?.localId;
+  const isMe = (e) => e.isPlayer && (e.humanId == null || e.humanId === localId);
   const offsets = [];
   const pcts = [];
   const rowFor = (list, team) => {
@@ -356,12 +385,12 @@ export function showLoadingScreen(root, config, champions, renderPortrait) {
       const pct = h('div.ld-pct.num', '0%');
       pcts.push(pct);
       offsets.push(Math.random() * 0.18);
-      row.appendChild(h(`div.ld-card${e.isPlayer ? '.me' : ''}`,
+      row.appendChild(h(`div.ld-card${isMe(e) ? '.me' : ''}`,
         h('div.ld-card-img', img),
         h('div.ld-card-plate',
           h('div.ld-card-champ', def.name || e.championId),
           h('div.ld-card-name', e.isPlayer ? (e.name || PLAYER_NAME) : `${e.name || '电脑'}`),
-          h('div.ld-card-sub', e.isPlayer ? (config?.spectate ? 'AI 托管' : '玩家') : `电脑 · ${diffText}`),
+          h('div.ld-card-sub', e.isPlayer ? (config?.spectate ? 'AI 托管' : isMe(e) && config?.lan ? '你' : '玩家') : `电脑 · ${diffText}`),
           spells),
         pct));
     });

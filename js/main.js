@@ -16,10 +16,13 @@
 //    → renderer.render(0) 预热 → loading.close() → 主循环。
 //  每帧：dt = min(0.1, 真实间隔) → input.update(dt) → game.update(dt) → renderer.render(dt) → ui.update(dt) → audio.update(dt)。
 //  首次用户手势（pointerdown / keydown）调用 audio.unlock()。gameOver 后由 UI 显示结算，「再来一局」调用 opts.onRestart()。
-//  URL：autostart=1 champ=<id> team=0|1 speed=<n> difficulty=easy|normal|hard autopilot=1 spectate=1 seed=<n>
+//  URL：autostart=1 champ=<id> team=0|1 role=top|jungle|mid|adc|support speed=<n> difficulty=easy|normal|hard autopilot=1 spectate=1 seed=<n>
 //       quality=low|medium|high time=<秒> debug=1 mute=1（另：reveal=1 显示全图单位，调试用）
+//  局域网（页面由 server.mjs 提供时）：选人界面「局域网对战」→ js/ui/lobby.js 大厅 → 服务器下发 start{config, seed}
+//    → 各客户端用同一 config/种子创建 Game → 主循环不再调用 game.update，改由 js/net/lockstep.js 按服务器 tick 执行命令并 step。
 //  调试：window.__game / __renderer / __ui / __input / __fx / __audio / __perf（滚动平均 frameMs/simMs/renderMs/uiMs/fps）/ __config / __modules
 import { TICK, MAP_SIZE, DIFFICULTY } from './config.js';
+import { assignLineup, isRole, defaultRole } from './net/roles.js';
 
 // main.js 已开始执行：关闭 index.html 的 8 秒超时提示；之后的启动错误由本文件显示
 window.__booted = true;
@@ -57,6 +60,7 @@ export function parseParams(search = location.search) {
   return {
     autostart: flag('autostart'),
     champ: (q.get('champ') || '').trim().toLowerCase() || null,
+    role: oneOf('role', ROLES),
     team: team === '1' || team === 'red' ? 1 : team === '0' || team === 'blue' ? 0 : null,
     speed: num('speed', 1, 0.1, 16),
     difficulty: oneOf('difficulty', ['easy', 'normal', 'hard']),
@@ -138,36 +142,16 @@ function validSummoners(list, SUMMONERS) {
   if (!Array.isArray(list) || list.length !== 2 || list[0] === list[1]) return null;
   return list.every((id) => SUMMONERS[id]) ? list.slice() : null;
 }
-// 默认阵容：玩家英雄放到其所在默认分路（与对面同路英雄互换），其余位置按分路补齐
-export function buildTeams(CHAMPIONS, championId, team = 0) {
+// 默认阵容：玩家英雄放到所选位置（role，默认为英雄主位置），其余位置优先使用默认阵容、按位置补齐（确定性，分配逻辑见 js/net/roles.js）
+export function buildTeams(CHAMPIONS, championId, team = 0, role = null) {
   const ids = Object.keys(CHAMPIONS);
-  const teams = DEFAULT_LINEUP.map((l) => l.slice());
-  const used = new Set();
-  for (const t of teams) for (let i = 0; i < 5; i++) {
-    if (!CHAMPIONS[t[i]] || used.has(t[i])) t[i] = null; else used.add(t[i]);
-  }
-  for (const t of teams) for (let i = 0; i < 5; i++) {
-    if (t[i]) continue;
-    const role = ROLES[i];
-    const id = ids.find((c) => !used.has(c) && (CHAMPIONS[c].roles || []).includes(role)) || ids.find((c) => !used.has(c)) || ids[i % ids.length];
-    t[i] = id; used.add(id);
-  }
-  let pi = -1;
-  if (championId && CHAMPIONS[championId]) {
-    pi = teams[team].indexOf(championId);
-    if (pi < 0) {
-      const oi = teams[1 - team].indexOf(championId);
-      if (oi >= 0) { teams[1 - team][oi] = teams[team][oi]; teams[team][oi] = championId; pi = oi; }
-      else {
-        pi = Math.max(0, ROLES.indexOf((CHAMPIONS[championId].roles || [])[0]));
-        teams[team][pi] = championId;
-      }
-    }
-  }
-  return teams.map((list, t) => list.map((id, i) => ({
-    championId: id, role: ROLES[i], isPlayer: t === team && i === pi, summoners: ROLE_SUMMONERS[ROLES[i]].slice(),
-    name: t === team && i === pi ? PLAYER_NAME : undefined,
-  })));
+  const pid = championId && CHAMPIONS[championId] ? championId : (CHAMPIONS.garen ? 'garen' : ids[0]);
+  const pRole = isRole(role) ? role : defaultRole(CHAMPIONS[pid]);
+  const { blue, red } = assignLineup({
+    champions: CHAMPIONS, preferred: DEFAULT_LINEUP,
+    humans: [{ team, role: pRole, championId: pid, summoners: ROLE_SUMMONERS[pRole].slice(), name: PLAYER_NAME, isPlayer: true }],
+  });
+  return [blue, red];
 }
 export function buildConfig(raw, params, CHAMPIONS, SUMMONERS = {}) {
   const cfg = raw && typeof raw === 'object' ? raw : {};
@@ -189,7 +173,7 @@ export function buildConfig(raw, params, CHAMPIONS, SUMMONERS = {}) {
   }) : null);
   let blue = normTeam(cfg.blue), red = normTeam(cfg.red);
   if (!blue || !red || blue.includes(null) || red.includes(null)) {
-    [blue, red] = buildTeams(CHAMPIONS, championId, team);
+    [blue, red] = buildTeams(CHAMPIONS, championId, team, isRole(cfg.role) ? cfg.role : params.role);
   } else {
     // 恰好一名玩家：优先按 championId + team 匹配
     const all = [...blue.map((e) => [0, e]), ...red.map((e) => [1, e])];
@@ -215,6 +199,48 @@ export function buildConfig(raw, params, CHAMPIONS, SUMMONERS = {}) {
     quality: params.quality || cfg.quality || 'high',
     time: params.time || 0,
     debug: params.debug, mute: !!(params.mute || cfg.mute), reveal: params.reveal,
+  };
+}
+
+// 局域网：服务器下发的 config（与单人 Config 同构，真人条目带 humanId）→ 本机 Config
+export function buildLanConfig(lan, params, CHAMPIONS, SUMMONERS = {}, picked = null) {
+  const sc = lan.config || {};
+  const norm = (list) => (list || []).map((e, i) => {
+    const o = { ...(e || {}) };
+    if (!CHAMPIONS[o.championId]) throw new BootError('局域网对局数据无效：未知英雄 ' + o.championId);
+    o.role = ROLES.includes(o.role) ? o.role : ROLES[i];
+    o.summoners = validSummoners(o.summoners, SUMMONERS) || ROLE_SUMMONERS[o.role].slice();
+    o.isPlayer = o.humanId != null;   // 真人（含其他玩家）不挂 AI
+    return o;
+  });
+  const blue = norm(sc.blue), red = norm(sc.red);
+  if (blue.length !== 5 || red.length !== 5) throw new BootError('局域网对局数据无效：阵容不足 10 人');
+  const hit = [...blue.map((e) => [0, e]), ...red.map((e) => [1, e])].find(([, e]) => e.humanId === lan.localId);
+  if (!hit) throw new BootError('局域网对局数据无效：找不到本机玩家');
+  return {
+    championId: hit[1].championId, team: hit[0], difficulty: DIFFICULTY[sc.difficulty] ? sc.difficulty : 'normal',
+    speed: 1, spectate: false, autopilot: false, summoners: hit[1].summoners.slice(), blue, red,
+    seed: Number.isFinite(lan.seed) ? lan.seed : sc.seed,
+    quality: params.quality || picked?.quality || 'high', time: 0,
+    debug: params.debug, mute: !!params.mute, reveal: false,
+    lan: { localId: lan.localId },
+  };
+}
+
+// —— 局域网：状态横幅（等待加载 / 不同步 / 断线） ——
+function makeNetBanner(app) {
+  const el = document.createElement('div');
+  el.className = 'net-banner';
+  app.appendChild(el);
+  let timer = 0;
+  return {
+    show(text, kind = 'info', seconds = 0) {
+      el.textContent = text;
+      el.className = `net-banner on ${kind}`;
+      clearTimeout(timer);
+      if (seconds > 0) timer = setTimeout(() => { el.className = 'net-banner'; }, seconds * 1000);
+    },
+    hide() { clearTimeout(timer); el.className = 'net-banner'; },
   };
 }
 
@@ -454,9 +480,9 @@ const FB_CSS = `
 @media (max-width:640px){.fb-hud{grid-template-columns:1fr auto}.fb-who{grid-column:1/-1}.fb-sk{width:40px;height:40px}.fb-tip{display:none}}
 `;
 class FallbackUI {
-  constructor(game, renderer, input, { root, screenRoot, shop, items, onRestart }) {
+  constructor(game, renderer, input, { root, screenRoot, shop, items, onRestart, lan = false }) {
     this.game = game; this.renderer = renderer; this.input = input;
-    this.shop = shop; this.items = items || {}; this.onRestart = onRestart; this.screenRoot = screenRoot;
+    this.shop = shop; this.items = items || {}; this.onRestart = onRestart; this.screenRoot = screenRoot; this.lan = !!lan;
     this.isFallback = true;
     if (!$('fb-style')) {
       const st = document.createElement('style');
@@ -518,7 +544,7 @@ class FallbackUI {
     this._banner(bought.length ? `已购买：${bought.map((id) => this.items[id]?.name || id).join('、')}` : '金币不足或没有可购买的推荐装备', 2.5);
   }
   _togglePause() {
-    if (this.game.over) return;
+    if (this.game.over || this.lan) return;
     this.game.paused = !this.game.paused;
     if (this.game.paused) this._banner('已暂停 · 按 Esc 继续', Infinity);
     else { this._bannerUntil = 0; this.$.banner.classList.remove('on'); }
@@ -609,6 +635,7 @@ function makeDebug(app, ctx) {
   let acc = 1;
   window.addEventListener('keydown', (e) => {
     const g = ctx.game;
+    if (ctx.lan && e.code !== 'F9') return;   // 局域网：禁用倍速与暂停
     if (e.code === 'Equal' || e.code === 'NumpadAdd') g.speed = Math.min(16, g.speed * 2);
     else if (e.code === 'Minus' || e.code === 'NumpadSubtract') g.speed = Math.max(0.125, g.speed / 2);
     else if (e.code === 'F9') { e.preventDefault(); ctx.renderer.revealAll = !ctx.renderer.revealAll; }
@@ -691,13 +718,21 @@ async function boot() {
     try {
       picked = await csMod.showChampSelect(screenRoot, {
         champions: CHAMPIONS, summoners: SUMMONERS, renderPortrait,
-        defaults: { championId: params.champ, team: params.team ?? 0, difficulty: params.difficulty || 'normal', speed: params.speed, spectate: params.spectate },
+        defaults: { championId: params.champ, team: params.team ?? 0, role: params.role, difficulty: params.difficulty || 'normal', speed: params.speed, spectate: params.spectate },
       });
     } catch (err) {
       console.error('[启动] 选人界面出错，使用默认配置开局：', err);
     }
   }
-  const config = buildConfig(picked, params, CHAMPIONS, SUMMONERS);
+  // 1b) 局域网：进入大厅，等待房主开始（返回服务器下发的 config 与种子）
+  let lan = null;
+  if (picked?.lan) {
+    let lobbyMod;
+    try { lobbyMod = await import('./ui/lobby.js'); } catch (err) { throw new BootError('无法加载局域网大厅（js/ui/lobby.js）', err); }
+    lan = await lobbyMod.showLobby(screenRoot, { champions: CHAMPIONS, summoners: SUMMONERS, renderPortrait, initial: picked });
+    window.__net = lan.client;
+  }
+  const config = lan ? buildLanConfig(lan, params, CHAMPIONS, SUMMONERS, picked) : buildConfig(picked, params, CHAMPIONS, SUMMONERS);
   window.__config = config;
 
   // 2) 加载画面
@@ -709,6 +744,8 @@ async function boot() {
   const itemsMod = optional(await L.items, '装备', 'js/items/items.js');
   const shopMod = optional(await L.shop, '商店', 'js/items/shop.js');
   const createAI = typeof aiMod?.createAI === 'function' ? aiMod.createAI : null;
+  if (lan && !createAI) throw new BootError('局域网对战需要 AI 模块（js/ai/championAI.js）');
+  if (lan && !shopMod) throw new BootError('局域网对战需要商店模块（js/items/shop.js）');
 
   const game = new Game({
     blue: config.blue, red: config.red, champions: CHAMPIONS, createAI,
@@ -716,6 +753,25 @@ async function boot() {
   });
   if (typeof itemsMod?.recomputeItemStats === 'function') game.recomputeItemStats = itemsMod.recomputeItemStats;
   window.__game = game;
+
+  // 局域网：本机玩家 = humanId 对应的英雄；其他真人英雄不挂 AI、不受本机输入控制；命令经服务器按 tick 执行
+  let lockstep = null, shopForUI = shopMod, netNotice = null;
+  if (lan) {
+    const netMod = await import('./net/lockstep.js');
+    const humans = netMod.mapHumans(game, config);
+    const me = humans.get(lan.localId);
+    if (!me) throw new BootError('局域网对局数据无效：找不到本机英雄');
+    game.player = me;
+    for (const [id, c] of humans) c.humanId = id;
+    lockstep = new netMod.Lockstep(game, {
+      localId: lan.localId, humans, createAI, shop: shopMod, difficulty: config.difficulty,
+      send: (m) => lan.client.send(m), onNotice: (text) => netNotice?.(text),
+    });
+    lockstep.wrapChampion(me);
+    shopForUI = lockstep.shopProxy(shopMod);
+    lan.client.on('tick', (m) => lockstep.pushTick(m));
+    window.__lockstep = lockstep;
+  }
 
   if (config.time > 0) {
     await fastForward(game, config.time, createAI, (p, t) => loading.setProgress(0.1 + 0.2 * p, `正在快进到 ${fmtTime(config.time)}（${fmtTime(t)}）`));
@@ -801,15 +857,17 @@ async function boot() {
   loading.setProgress(0.9, '正在加载界面');
   const uiMod = optional(await L.ui, '界面', 'js/ui/ui.js');
   let ui = typeof uiMod?.UI === 'function' ? construct('界面', () => new uiMod.UI(game, renderer, input, {
-    root: uiRoot, audio, champions: CHAMPIONS, summoners: SUMMONERS, items: itemsMod?.ITEMS || {}, shop: shopMod,
+    root: uiRoot, audio, champions: CHAMPIONS, summoners: SUMMONERS, items: itemsMod?.ITEMS || {}, shop: shopForUI,
     renderPortrait, screenRoot, config, onRestart: restart,
+    onSurrender: lockstep ? () => lockstep.requestSurrender() : null,
   })) : null;
-  if (!ui) ui = new FallbackUI(game, renderer, input, { root: uiRoot, screenRoot, shop: shopMod, items: itemsMod?.ITEMS, onRestart: restart });
+  if (!ui) ui = new FallbackUI(game, renderer, input, { root: uiRoot, screenRoot, shop: shopForUI, items: itemsMod?.ITEMS, onRestart: restart, lan: !!lockstep });
   window.__ui = ui;
 
   // 9) 预热一帧（编译着色器）后进入游戏
   loading.setProgress(0.97, '即将进入召唤师峡谷');
   await nextFrame();
+  guard('fxWarmup', () => fx?.warmup?.());
   guard('warmup', () => renderer.render(0));
   loading.setProgress(1, '欢迎来到召唤师峡谷');
   await nextFrame();
@@ -821,7 +879,18 @@ async function boot() {
   // 10) 主循环
   const perf = { frameMs: 0, simMs: 0, renderMs: 0, uiMs: 0, fps: 60, dtMs: 16.7, frames: 0 };
   window.__perf = perf;
-  const dbg = config.debug ? makeDebug(app, { game, renderer, perf }) : null;
+  const dbg = config.debug ? makeDebug(app, { game, renderer, perf, lan: !!lockstep }) : null;
+  // 局域网：通知服务器加载完成，等待所有玩家就绪；不同步 / 断线提示
+  let netBanner = null;
+  if (lockstep) {
+    netBanner = makeNetBanner(app);
+    netNotice = (text) => { if (typeof ui.feed?.toast === 'function') guard('netToast', () => ui.feed.toast(text, 3)); else netBanner.show(text, 'info', 3); };
+    lan.client.on('desync', (m) => netBanner.show(`检测到对局不同步（第 ${m.n} 帧）：各玩家看到的画面可能不一致`, 'warn', 8));
+    lan.client.on('close', () => { if (!game.over) netBanner.show('与局域网服务器的连接已断开，对局无法继续同步', 'error'); });
+    game.events.on('gameOver', (e) => lan.client.send({ type: 'over', winner: e?.winner }));
+    lan.client.send({ type: 'loaded' });
+    netBanner.show('等待其他玩家加载…', 'info');
+  }
   const EMA = 0.08;
   const ema = (a, b) => a + (b - a) * EMA;
   let last = 0;
@@ -831,7 +900,10 @@ async function boot() {
     last = now;
     const t0 = performance.now();
     guard('input', () => input.update(realDt));
-    guard('game', () => game.update(realDt));
+    if (lockstep) {
+      guard('net', () => lockstep.frame(realDt));
+      if (netBanner && lockstep.started && !netBanner.started) { netBanner.started = true; netBanner.hide(); }
+    } else guard('game', () => game.update(realDt));
     const t1 = performance.now();
     guard('render', () => renderer.render(realDt));
     const t2 = performance.now();

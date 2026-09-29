@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>图标图鉴</title>
+<!-- 开发用：网格展示全部装备、技能、召唤师技能、Buff 与单位图标（均为 iconart.js 程序化绘制）。参数：?only=items|abilities|summoners|buffs|units &size=64 -->
+<style>
+  :root { --bg: #0b1016; --fg: #e8dcc0; --muted: #8a94a0; --gold: #c8aa6e; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 12px/1.35 "Noto Sans SC", system-ui, sans-serif; }
+  main { padding: 10px 14px; }
+  h2 { font-size: 14px; color: var(--gold); margin: 10px 0 6px; border-bottom: 1px solid #2a2418; padding-bottom: 3px; }
+  h2 small { color: var(--muted); font-weight: normal; margin-left: 8px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 6px 4px; }
+  .tile { width: 78px; display: flex; flex-direction: column; align-items: center; position: relative; }
+  .tile img.big { width: var(--sz, 64px); height: var(--sz, 64px); display: block; }
+  .tile img.sm { position: absolute; right: 0; top: 0; width: 24px; height: 24px; outline: 1px solid #000; }
+  .tile span { margin-top: 2px; text-align: center; width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+  .tile.fallback span { color: #ff8a6a; }
+  .champ { display: flex; gap: 4px; align-items: flex-start; margin-right: 14px; }
+  .champ b { writing-mode: vertical-rl; color: var(--muted); font-weight: normal; font-size: 11px; }
+  #stat { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <div id="stat">加载中…</div>
+  <div id="out"></div>
+</main>
+<script type="module">
+import { iconURL, unitIconURL } from '../js/ui/icons.js';
+import { ITEMS } from '../js/items/items.js';
+import { CHAMPION_LIST } from '../js/champions/index.js';
+import { SUMMONERS } from '../js/core/summoners.js';
+import { hasItemArt, hasAbilityArt, hasSummonerArt, hasBuffArt } from '../js/ui/iconart.js';
+
+const qs = new URLSearchParams(location.search);
+const only = qs.get('only');
+const SZ = Number(qs.get('size')) || 64;
+const out = document.getElementById('out');
+const errors = [];
+let count = 0, fallback = 0;
+
+function tile(name, src, ok = true, small = null) {
+  const t = document.createElement('div');
+  t.className = 'tile' + (ok ? '' : ' fallback');
+  t.style.setProperty('--sz', SZ + 'px');
+  const img = document.createElement('img'); img.className = 'big'; img.src = src; img.alt = name; img.title = name;
+  t.appendChild(img);
+  if (small) { const s = document.createElement('img'); s.className = 'sm'; s.src = small; t.appendChild(s); }
+  const lab = document.createElement('span'); lab.textContent = name; t.appendChild(lab);
+  count++; if (!ok) fallback++;
+  return t;
+}
+function section(title, sub = '') {
+  const h = document.createElement('h2'); h.textContent = title;
+  if (sub) { const s = document.createElement('small'); s.textContent = sub; h.appendChild(s); }
+  const g = document.createElement('div'); g.className = 'grid';
+  out.append(h, g);
+  return g;
+}
+function safe(fn, label) { try { return fn(); } catch (e) { errors.push(label + ': ' + e.message); console.error(label, e); return ''; } }
+
+// —— 装备 ——
+if (!only || only === 'items') {
+  const order = { starter: 0, consumable: 1, basic: 2, boots: 3, epic: 4, legendary: 5 };
+  const list = Object.values(ITEMS).sort((a, b) => (order[a.tier] ?? 9) - (order[b.tier] ?? 9) || a.cost - b.cost);
+  const g = section('装备', `${list.length} 件（右上角为 24px 缩略）`);
+  for (const d of list) g.appendChild(tile(d.name, safe(() => iconURL(d.icon, SZ), d.id), hasItemArt(d.id), safe(() => iconURL(d.icon, 24), d.id)));
+}
+// —— 技能 ——
+if (!only || only === 'abilities') {
+  const g = section('英雄技能', '被动 / Q / W / E / R（含二段技能）');
+  for (const c of CHAMPION_LIST) {
+    const box = document.createElement('div'); box.className = 'champ';
+    const b = document.createElement('b'); b.textContent = c.name; box.appendChild(b);
+    const cells = [['P', c.passive]];
+    for (const s of ['Q', 'W', 'E', 'R']) { cells.push([s, c.abilities?.[s]]); if (c.abilities?.[s]?.recastIcon) cells.push([s + '2', { name: c.abilities[s].name + '·二段', icon: c.abilities[s].recastIcon }]); }
+    for (const [slot, a] of cells) if (a?.icon) box.appendChild(tile(`${slot} ${a.name}`, safe(() => iconURL(a.icon, SZ), c.id + slot), hasAbilityArt(c.id, slot), safe(() => iconURL(a.icon, 24), c.id + slot)));
+    g.appendChild(box);
+  }
+}
+// —— 召唤师技能 ——
+if (!only || only === 'summoners') {
+  const g = section('召唤师技能');
+  for (const id in SUMMONERS) { const d = SUMMONERS[id]; g.appendChild(tile(d.name, safe(() => iconURL(d.icon, SZ), id), hasSummonerArt(id), safe(() => iconURL(d.icon, 24), id))); }
+}
+// —— Buff ——
+if (!only || only === 'buffs') {
+  const g = section('Buff', '野怪 / 元素龙 / 男爵 / 其它；未登记的 Buff 退化为按颜色的通用符文');
+  const BUFFS = [
+    ['blue_buff', '洞悉烙印', ['#4aa0ff', '#0b2a55']], ['red_buff', '余烬烙印', ['#ff5a3a', '#5a1408']], ['red_buff_burn', '余烬灼烧', ['#ff7a3a', '#5a1a08']],
+    ['dragon_infernal', '炼狱亚龙之力', ['#ff7a3a', '#5a1a08']], ['dragon_mountain', '山脉亚龙之力', ['#c9a36a', '#3e2c14']], ['dragon_ocean', '海洋亚龙之力', ['#3ac8c8', '#0a3a44']],
+    ['dragon_cloud', '云端亚龙之力', ['#b8dcff', '#28405a']], ['dragon_soul', '龙魂', ['#ff7a3a', '#5a1a08']], ['elder_dragon', '远古巨龙之威', ['#e0f4ff', '#3a4a6a']],
+    ['baron', '纳什男爵之手', ['#b070ff', '#2a0a4a']], ['baron_corrosion', '腐蚀', ['#9a4dff', '#200a3a']], ['scuttle_shrine', '迅捷神龛', ['#7fe7ff', '#0a3a4a']],
+    ['item_grievous', '重伤', ['#b8323a', '#3a0a10']], ['darius_might', '诺克萨斯之力', ['#ff7a4a', '#6a0a0a']], ['jinx_q_fishbones', '鱼骨头', ['#ff8ab0', '#6a1a3a']],
+    ['annie_pyromania', '嗜火', ['#ffe07a', '#b8260a']], ['unknown_buff', '未知 Buff', ['#6ab0a0', '#102a24']],
+  ];
+  for (const [id, name, bg] of BUFFS) g.appendChild(tile(name, safe(() => iconURL({ bg }, SZ, { buffId: id }), id), hasBuffArt(id) || /^(dragon_soul|darius|jinx|annie)/.test(id)));
+}
+// —— 单位 ——
+if (!only || only === 'units') {
+  const g = section('单位（击杀信息 / 目标框）');
+  const UNITS = [['minion', '小兵', '#4a8ae0'], ['minion', '敌方小兵', '#e0503a'], ['turret', '防御塔', '#4a8ae0'], ['inhibitor', '水晶', '#e0503a'], ['nexus', '主水晶', '#4a8ae0'],
+    ['monster', '野怪', '#9cd35a'], ['dragon', '亚龙', '#ff7a3a'], ['baron', '纳什男爵', null], ['herald', '峡谷先锋', '#b07cff'], ['ward', '守卫', null], ['pet', '召唤物', null], ['execute', '处决', null]];
+  for (const [k, name, c] of UNITS) g.appendChild(tile(name, safe(() => unitIconURL(k, SZ, { color: c }), k)));
+}
+
+document.getElementById('stat').textContent = `共 ${count} 个图标；无专属插画（通用图形）${fallback} 个（名称标红）` + (errors.length ? `；错误 ${errors.length}：${errors.join(' | ')}` : '');
+window.__gallery = { count, fallback, errors };
+</script>
+</body>
+</html>

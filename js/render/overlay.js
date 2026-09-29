@@ -327,7 +327,7 @@ export class Overlay {
       g.fillStyle = '#10151b';
       g.fillRect(bx, ry, W, RH);
       const k = clamp01((u.mana || 0) / (u.maxMana || 1));
-      g.fillStyle = res === 'energy' ? '#e8c94a' : '#3b82e0';
+      g.fillStyle = res === 'energy' ? '#e8c94a' : res === 'flow' ? '#dfe6ee' : '#3b82e0';
       g.fillRect(bx, ry, W * k, RH);
       g.fillStyle = 'rgba(255,255,255,0.22)';
       g.fillRect(bx, ry, W * k, 1);

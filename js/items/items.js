@@ -1058,6 +1058,12 @@ export const BUILDS = {
   ashe:     { start: ['doransblade', 'healthpotion'], core: ['kraken', 'runaans', 'infinityedge', 'lorddominik', 'bloodthirster'], boots: 'berserkers', situational: ['bork', 'guardianangel', 'quicksilver', 'rapidfire'] },
   jinx:     { start: ['doransblade', 'healthpotion'], core: ['kraken', 'infinityedge', 'rapidfire', 'lorddominik', 'bloodthirster'], boots: 'berserkers', situational: ['runaans', 'guardianangel', 'quicksilver'] },
   thresh:   { start: ['worldatlas', 'healthpotion', 'healthpotion'], core: ['locket', 'redemption', 'frozenheart', 'randuin', 'spiritvisage'], boots: 'mercs', situational: ['thornmail', 'warmog', 'zhonya'] },
+  ezreal:   { start: ['doransblade', 'healthpotion'], core: ['trinity', 'blackcleaver', 'lorddominik', 'bloodthirster', 'guardianangel'], boots: 'ionian', situational: ['deathsdance', 'frozenheart', 'youmuu', 'quicksilver'] },
+  malphite: { start: ['doransshield', 'healthpotion'], core: ['sunfire', 'thornmail', 'frozenheart', 'randuin', 'spiritvisage'], boots: 'plated', situational: ['zhonya', 'warmog', 'locket'] },
+  morgana:  { start: ['worldatlas', 'healthpotion', 'healthpotion'], core: ['zhonya', 'rylai', 'morellonomicon', 'redemption', 'locket'], boots: 'sorcshoes', situational: ['voidstaff', 'rabadon', 'shadowflame'] },
+  yasuo:    { start: ['doransblade', 'healthpotion'], core: ['rapidfire', 'infinityedge', 'bloodthirster', 'deathsdance', 'lorddominik'], boots: 'berserkers', situational: ['guardianangel', 'bork', 'steraks', 'quicksilver'] },
+  zed:      { start: ['longsword', 'healthpotion', 'healthpotion'], core: ['youmuu', 'blackcleaver', 'deathsdance', 'lorddominik', 'guardianangel'], boots: 'ionian', situational: ['steraks', 'bloodthirster', 'quicksilver'] },
+  xinzhao:  { start: ['huntersmachete', 'healthpotion'], core: ['trinity', 'steraks', 'deathsdance', 'blackcleaver', 'guardianangel'], boots: 'plated', situational: ['randuin', 'spiritvisage', 'thornmail', 'sunfire'] },
 };
 // 通用后备出装（按定位）
 export const DEFAULT_BUILDS = {

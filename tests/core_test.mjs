@@ -951,7 +951,7 @@ test('Game.update 按固定步长推进并限制单帧', () => {
   assert(game.time === t, '暂停');
 });
 test('英雄注册表与定义完整性', () => {
-  assert(CHAMPION_LIST.length === 10, '10 个英雄');
+  assert(CHAMPION_LIST.length >= 16, '至少 16 个英雄');
   for (const def of CHAMPION_LIST) {
     assert(def.id && def.name && def.baseStats && def.passive && def.ai, `${def.id} 基本字段`);
     for (const s of ['Q', 'W', 'E', 'R']) {

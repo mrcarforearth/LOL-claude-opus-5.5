@@ -1,11 +1,12 @@
 // 击杀信息（右侧：击杀者 → 被击杀者、助攻、多杀、建筑与史诗野怪）、公告横幅（屏幕中上，按我方/敌方着色）、屏幕中央小提示
 import { h, DRAGON_META } from './dom.js';
+import { unitIconURL, unitIconFor } from './icons.js';
 
 const MULTI = [null, null, '双杀', '三杀', '四杀', '五杀'];
 const KILL_KEYS = new Set(['kill', 'firstBlood', 'doubleKill', 'tripleKill', 'quadraKill', 'pentaKill', 'killingSpree', 'rampage', 'unstoppable', 'godlike', 'legendary', 'shutdown', 'executed']);
 const BIG_KEYS = new Set(['firstBlood', 'pentaKill', 'quadraKill', 'ace', 'legendary', 'godlike', 'baronSlain', 'inhibitorDestroyed']);
-const GLYPH = { minion: '兵', turret: '塔', inhibitor: '晶', nexus: '枢', monster: '怪', pet: '宠', ward: '眼' };
-const OBJ = { dragon: ['龙', '亚龙'], baron: ['男', '纳什男爵'], herald: ['先', '峡谷先锋'] };
+const OBJ = { dragon: ['dragon', '亚龙'], baron: ['baron', '纳什男爵'], herald: ['herald', '峡谷先锋'] };
+const REL_COLOR = { ally: '#4a8ae0', enemy: '#e0503a', neutral: '#c8aa6e' };
 const MAX_ENTRIES = 6;
 
 export class Feed {
@@ -33,17 +34,20 @@ export class Feed {
     this.ui.portraits.apply(img, c.championId);
     return img;
   }
-  glyphIcon(glyph, rel, color = null) {
-    const el = h(`div.kf-g.${rel}`, glyph);
+  // 图形单位图标（不再使用文字）：src 为 dataURL
+  glyphIcon(src, rel, color = null) {
+    const el = h(`div.kf-g.${rel}`, h('img', { alt: '', draggable: 'false', src, style: { width: '100%', height: '100%', display: 'block', borderRadius: '2px' } }));
     if (color) el.style.setProperty('--gc', color);
+    el.style.padding = '0'; el.style.overflow = 'hidden';
     return el;
   }
+  kindIcon(kind, rel, color = null) { return this.glyphIcon(unitIconURL(kind, 40, { color: color || REL_COLOR[rel] || null, frame: false }), rel, color); }
   unitIcon(u) {
-    if (!u) return this.glyphIcon('?', 'neutral');
+    if (!u) return this.kindIcon('unknown', 'neutral');
     if (u.type === 'champion') return this.champIcon(u);
     if (u.type === 'pet' && u.owner?.type === 'champion') return this.champIcon(u.owner);
     const rel = u.team === this.team ? 'ally' : u.team === 0 || u.team === 1 ? 'enemy' : 'neutral';
-    return this.glyphIcon(u.type === 'monster' && u.name ? u.name[0] : GLYPH[u.type] || '?', rel);
+    return this.glyphIcon(unitIconFor(u, rel, 40, { frame: false }), rel);
   }
 
   push(el) {
@@ -59,8 +63,7 @@ export class Feed {
     if (!v) return;
     const kc = e.killerChampion;
     const rel = v.team === this.team ? 'enemy' : 'ally';
-    const killer = e.executed || !kc ? this.unitIcon(e.killer && e.killer !== v ? e.killer : null) : this.champIcon(kc);
-    if (e.executed && !e.killer) killer.textContent = '处';
+    const killer = e.executed && !e.killer ? this.kindIcon('execute', 'neutral') : e.executed || !kc ? this.unitIcon(e.killer && e.killer !== v ? e.killer : null) : this.champIcon(kc);
     const assists = h('div.kf-assists');
     for (const a of (e.assists || []).slice(0, 4)) if (a && a !== kc) assists.appendChild(this.champIcon(a, '.sm'));
     const tag = e.multiKill >= 2 ? MULTI[Math.min(5, e.multiKill)] : e.shutdown ? '终结' : e.firstBlood ? '第一滴血' : '';
@@ -72,22 +75,22 @@ export class Feed {
   }
   onStructure(e) {
     const rel = e.team === this.team ? 'enemy' : 'ally';
-    const killer = e.killerChampion ? this.champIcon(e.killerChampion) : this.glyphIcon('兵', rel === 'ally' ? 'ally' : 'enemy');
-    const g = e.kind === 'inhibitor' ? '晶' : e.kind === 'nexus' ? '枢' : '塔';
+    const killer = e.killerChampion ? this.champIcon(e.killerChampion) : this.kindIcon('minion', rel === 'ally' ? 'ally' : 'enemy');
+    const g = e.kind === 'inhibitor' ? 'inhibitor' : e.kind === 'nexus' ? 'nexus' : 'turret';
     this.push(h(`div.kf-entry.${rel}.obj`,
       h('div.kf-side', killer), h('div.kf-mid', h('i.kf-sword')),
-      h('div.kf-side', this.glyphIcon(g, e.team === this.team ? 'ally' : 'enemy'))));
+      h('div.kf-side', this.kindIcon(g, e.team === this.team ? 'ally' : 'enemy'))));
   }
   onObjective(e) {
     const o = OBJ[e.kind];
     if (!o) return;
     const rel = e.team === this.team ? 'ally' : 'enemy';
     const color = e.kind === 'dragon' ? DRAGON_META[e.dragonType]?.color || '#ff8a3a' : e.kind === 'baron' ? '#a35cff' : '#b07cff';
-    const killer = e.killerChampion ? this.champIcon(e.killerChampion) : this.glyphIcon('兵', rel);
+    const killer = e.killerChampion ? this.champIcon(e.killerChampion) : this.kindIcon('minion', rel);
     const name = e.kind === 'dragon' ? DRAGON_META[e.dragonType]?.name || o[1] : o[1];
     this.push(h(`div.kf-entry.${rel}.obj`,
       h('div.kf-side', killer), h('div.kf-mid', h('i.kf-sword'), h('span.kf-tag', name)),
-      h('div.kf-side', this.glyphIcon(o[0], 'neutral', color))));
+      h('div.kf-side', this.kindIcon(o[0], 'neutral', color))));
   }
 
   // —— 公告横幅 ——

@@ -1198,6 +1198,45 @@ export class FX {
     this.partsN.update(this.time, scale, this.maxPoint);
   }
 
+  // 加载阶段预热：在玩家附近把所有图元、自定义特效、投射物外观各生成一次并预编译着色器，
+  // 避免实战中第一次同时放出多个技能时集中编译着色器导致长时间卡顿/无响应
+  warmup() {
+    const g = this.game, r = this.renderer;
+    const p = g.player || g.champions?.[0];
+    if (!p) return 0;
+    const enemy = (g.champions || []).find((c) => c.team !== p.team) || p;
+    const x = p.x, y = p.y;
+    const verts = Array.from({ length: 5 }, (_, i) => ({ x: x + 300 * Math.cos(i * 1.2566), y: y + 300 * Math.sin(i * 1.2566) }));
+    const P = {
+      x, y, x1: x, y1: y, x2: x + 300, y2: y, lx: x, ly: y, dirX: 1, dirY: 0, angle: 0, arc: 90, radius: 200, range: 400,
+      width: 60, halfLength: 300, color: 0xffffff, duration: 0.2, unit: p, target: enemy, from: p, to: enemy,
+      verts, broken: [false, false, false, false, false], walls: 5, always: true,
+    };
+    let n = 0;
+    const T = (f) => { try { f(); n++; } catch { /* 预热失败不影响游戏 */ } };
+    for (const m of ['ring', 'disc', 'telegraph', 'line', 'cone', 'burst', 'slash', 'spin', 'shield', 'aura', 'flash', 'recall', 'levelUp', 'shockwave']) {
+      if (typeof this[m] === 'function') T(() => this[m]({ ...P }));
+    }
+    for (const style of ['small', 'phys', 'spark', 'magic', 'fire', 'explosion', 'explosionSmall', 'big', 'frost', 'light']) T(() => this.impact({ ...P, style }));
+    for (const style of [undefined, 'lightning', 'chain']) T(() => this.beam({ ...P, style }));
+    for (const kind of ['weaponGlow', 'flames', 'sparkles', 'electric', 'frost', 'haste', 'heal', 'silence', 'stun']) T(() => this.attach({ ...P, kind }));
+    for (const name of this.customs.keys()) T(() => this.custom(name, { ...P }));
+    const fakes = [];
+    for (const kind of this.projKinds.keys()) {
+      const proj = { id: -1 - fakes.length, x, y, prevX: x, prevY: y, h: 100, dirX: 1, dirY: 0, speed: 1000, width: 60,
+        vfx: { kind, color: 0xffffff, size: 1 }, owner: p, target: enemy, age: 0, traveled: 0, dead: false, data: {} };
+      fakes.push(proj);
+      T(() => this.projectile(proj));
+    }
+    try { this.update(1 / 60); } catch { /* 忽略 */ }
+    try { r.webgl.compile(r.scene, r.camera); } catch { /* 忽略 */ }
+    try { r.render(0); } catch { /* 忽略 */ }
+    for (const f of fakes) f.dead = true;
+    this.clear();
+    try { this.update(1 / 60); } catch { /* 忽略 */ }
+    return n;
+  }
+
   stats() {
     let decals = 0;
     for (const e of this.effects) if (e.object3d?.name === 'fxDecal') decals++;

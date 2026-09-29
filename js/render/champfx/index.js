@@ -1,5 +1,5 @@
-// 英雄专属特效注册表（core）：并行加载 10 个英雄的 champfx 文件（单个文件缺失/出错不影响其他），registerChampionFX(fx) 逐个注册
-export const CHAMPFX_IDS = ['garen', 'darius', 'leesin', 'masteryi', 'ahri', 'lux', 'annie', 'ashe', 'jinx', 'thresh'];
+// 英雄专属特效注册表（core）：并行加载全部英雄的 champfx 文件（单个文件缺失/出错不影响其他），registerChampionFX(fx) 逐个注册
+export const CHAMPFX_IDS = ['garen', 'darius', 'leesin', 'masteryi', 'ahri', 'lux', 'annie', 'ashe', 'jinx', 'thresh', 'yasuo', 'ezreal', 'malphite', 'zed', 'morgana', 'xinzhao'];
 
 export const CHAMPFX_MODULES = {};   // id → register(fx)
 export const champfxStatus = {};     // id → 'loaded' | 'registered' | 'missing' | 'error'

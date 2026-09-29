@@ -1,9 +1,18 @@
 // 程序化动画：依据 entity.anim（状态/时间/速度/前摇/槽位）与 modelState 生成目标姿态并平滑混合，外加披风/尾巴/发辫等次级运动
 // 角度约定（骨骼局部，XYZ 欧拉）：手臂/腿 z>0 向前摆；脊柱 z<0 前倾；右臂 x<0 外展（左臂镜像）；手臂 y 为水平扫动（arm() 中 twist>0 = 向内）。
-import * as THREE from 'three';
-import { PI, TAU, clamp, clamp01, smooth, mix } from './kit.js';
+//
+// 风格（style）= 一组姿态函数，决定某类武器/英雄的 idle/run/attack/cast/kneel/dash/stunned/channel 叠加动作：
+//   { idle(A, ms, b), run(A, ms, s, c), attack(A, attackIndex, ms, p), cast(A, slot, ms, t), kneel?(A, ms, k), dash?(A, ms),
+//     stunned?(A, ms), channel?(A, ms, t), spark?(A), runFreq?, runAmp?, runLean? }
+//   A = Animator；p = anim.t / anim.windup（p=1 为命中峰值）；t = 状态已持续秒数；b = 呼吸相位 sin。
+//   在 attack/cast 中先调用 A.phases(p) 设定四段关键帧权重，再用 A.armQ / A.RQ / A.q 写「静止 → 蓄力 → 峰值 → 随势 → 恢复」插值。
+//   内置风格：base greatsword axe fists katana orb wand annie bow gun lantern brute（见文件末尾 STYLES）；
+//   英雄文件可设 bp.meta.style = '内置名' 或 { ...自定义函数 }（缺省函数回落到 base），也可 registerStyle(name, style)。
+import { TAU, clamp, smooth, mix } from './kit.js';
 
-const EX_MPOS = 0, EX_MROT = 3, EX_HIPS = 6; // 附加通道：mover 位置/旋转、骨盆位移
+// 附加通道：mover 位置/旋转、骨盆位移（自定义风格可写 A.ex[EX.MROT + 1] 等）
+const EX_MPOS = 0, EX_MROT = 3, EX_HIPS = 6;
+export const EX = { MPOS: EX_MPOS, MROT: EX_MROT, HIPS: EX_HIPS };
 
 export class Animator {
   constructor(bp, inst, seed = 0) {
@@ -78,14 +87,17 @@ export class Animator {
     const a = e.anim || {};
     const ms = e.modelState || {};
     const state = v.dead ? 'death' : (a.state || 'idle');
-    if (state !== this.st) { this.st = state; this.t = a.t || 0; this.rawT = a.t; }
-    else if (a.t !== this.rawT) { this.rawT = a.t; this.t = Math.max(a.t || 0, this.t - 0.03); }
+    // 模拟 30Hz 推进 anim.t，渲染帧之间自行累加；anim.t 回退（新一次普攻/施法）或攻击序号变化时重新计时
+    const idx = a.attackIndex || 0;
+    if (state !== this.st || idx !== this.atkIdx || (a.t != null && this.rawT != null && a.t < this.rawT - 1e-4)) {
+      this.st = state; this.t = a.t || 0; this.rawT = a.t; this.atkIdx = idx;
+    } else if (a.t !== this.rawT) { this.rawT = a.t; this.t = Math.max(a.t || 0, this.t - 0.03); }
     else this.t += dt;
     const t = this.t;
     this.tgt.fill(0);
     this.ex.fill(0);
     this.drawString = 0;
-    const style = STYLES[this.meta.style] || STYLES.base;
+    const style = this.style || (this.style = resolveStyle(this.meta.style));
     let rate = 13;
     const moving = state === 'run' || state === 'dash';
     this.moveK += ((moving ? 1 : 0) - this.moveK) * Math.min(1, dt * 5);
@@ -111,7 +123,10 @@ export class Animator {
         break;
       }
       case 'recall': this.kneel(style, ms, t); rate = 8; break;
-      case 'channel': this.idle(style, ms); this.phases(t / 0.25); (style.channel || chantPose)(this, ms, t); this.plant(); break;
+      case 'channel':
+        if (style.channel) { this.idle(style, ms); this.phases(t / 0.25); style.channel(this, ms, t); this.plant(); }
+        else { this.kneel(style, ms, t); rate = 8; }
+        break;
       case 'dash': this.dash(e, style, ms); rate = 18; break;
       case 'airborne': this.airborne(t); rate = 16; break;
       case 'stunned': this.stunned(style, ms); break;
@@ -344,13 +359,13 @@ export class Animator {
     m.rotation.set(this.exCur[EX_MROT], this.exCur[EX_MROT + 1], this.exCur[EX_MROT + 2]);
     v.drawString = this.drawString;
   }
-  reset() { this.first = true; this.st = null; this.spinT = 0; this.spinAng = 0; }
+  reset() { this.first = true; this.st = null; this.rawT = null; this.spinT = 0; this.spinAng = 0; }
 }
 
 function noop() {}
 
-// 通用吟唱（channel）：双手前伸
-function chantPose(A, ms, t) {
+// 通用吟唱（style.channel 可直接引用）：双手前伸
+export function chantPose(A, ms, t) {
   const w = Math.sin(t * 4) * 0.05;
   A.arm('R', 1.1 + w, 0.35, 0.3, 0.6);
   A.arm('L', 1.1 - w, 0.35, 0.3, 0.6);
@@ -376,7 +391,14 @@ function meditate(A) {
 }
 
 // ———————————————— 各武器风格 ————————————————
-const STYLES = {};
+export const STYLES = {};
+
+// 注册 / 解析风格
+export function registerStyle(name, style) { STYLES[name] = { ...STYLES.base, ...style }; }
+export function resolveStyle(st) {
+  if (st && typeof st === 'object') return { ...STYLES.base, ...st };
+  return STYLES[st] ? { ...STYLES.base, ...STYLES[st] } : STYLES.base;
+}
 
 STYLES.base = {
   idle() {},
@@ -892,4 +914,3 @@ STYLES.brute = {
   },
 };
 
-export const _test = { STYLES };

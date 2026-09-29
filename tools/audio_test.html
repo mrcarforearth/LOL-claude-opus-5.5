@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>音频试听</title>
+<style>
+  :root { --bg: #0d1117; --panel: #161b22; --fg: #e6edf3; --dim: #8b949e; --acc: #c8aa6e; --line: #30363d; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, "PingFang SC", sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 8px; color: var(--acc); }
+  h2 { font-size: 14px; margin: 18px 0 6px; color: var(--dim); font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; }
+  button { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 5px 10px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--acc); }
+  button.on { background: #3a2f16; border-color: var(--acc); }
+  label { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; color: var(--dim); }
+  #status { color: var(--dim); margin: 6px 0; }
+</style>
+</head>
+<body>
+<h1>峡谷对决 · 音频试听（开发用）</h1>
+<div id="status">点击任意按钮解锁音频</div>
+<div class="row" id="vol"></div>
+<h2>空间化（镜头相对声源的横向偏移 / 距离）</h2>
+<div class="row">
+  <label>横向 <input type="range" id="px" min="-2600" max="2600" value="0"></label>
+  <label>纵向 <input type="range" id="py" min="-2600" max="2600" value="0"></label>
+  <span id="pinfo"></span>
+</div>
+<h2>环境音</h2>
+<div class="row">
+  <button id="amb">环境音：关</button>
+  <label>河道距离 <input type="range" id="river" min="0" max="3000" value="2000"></label>
+</div>
+<h2>回城循环</h2>
+<div class="row"><button id="recall">开始回城</button></div>
+<div id="groups"></div>
+<h2>语音播报（我方视角 / 敌方视角）</h2>
+<div class="row" id="voices"></div>
+<script type="module">
+import { AudioSystem, PRESET_GROUPS, VOICE_KEYS, lineFor } from '../js/audio/audio.js';
+import { LOOPS } from '../js/audio/presets.js';
+
+// 伪造的 game / renderer：镜头在原点，声源位置由滑块决定；河道距离由滑块决定
+const listeners = {};
+const player = { team: 0, x: 0, y: 0, alive: true };
+const game = {
+  time: 0, player,
+  events: { on(n, f) { (listeners[n] ||= []).push(f); return () => { listeners[n] = listeners[n].filter((x) => x !== f); }; }, emit(n, p) { for (const f of listeners[n] || []) f(p); } },
+  map: { riverDistance: () => Number(document.getElementById('river').value) },
+};
+const renderer = { cameraCtl: { target: { x: 0, y: 0 } } };
+const audio = new AudioSystem(game, renderer, { muted: false });
+let ambOn = false;
+audio.setVolume({ master: 0.8, sfx: 1, voice: 1, ambient: 0 });
+
+const status = document.getElementById('status');
+const src = () => ({ x: Number(document.getElementById('px').value), y: Number(document.getElementById('py').value) });
+const unlock = () => { audio.unlock(); status.textContent = `AudioContext：${audio.ctx?.state ?? '不可用'}，活动声部：${audio.engine?.activeCount?.() ?? 0}`; };
+const play = (name) => { unlock(); const p = src(); return audio.play(name, p.x || p.y ? { x: p.x, y: p.y } : {}); };
+
+// 音量
+for (const k of ['master', 'sfx', 'voice', 'ambient']) {
+  const r = document.createElement('input');
+  r.type = 'range'; r.min = 0; r.max = 100; r.value = k === 'ambient' ? 60 : k === 'master' ? 80 : 100;
+  r.oninput = () => audio.setVolume({ [k]: r.value / 100 });
+  const l = document.createElement('label'); l.append(`${k} `, r);
+  document.getElementById('vol').append(l);
+}
+const mute = document.createElement('button'); mute.textContent = '静音：关';
+mute.onclick = () => { audio.setMuted(!audio.muted); mute.textContent = `静音：${audio.muted ? '开' : '关'}`; };
+document.getElementById('vol').append(mute);
+
+const updInfo = () => { const p = src(); const s = audio._spatial(p.x, p.y); document.getElementById('pinfo').textContent = `距离 ${s.dist.toFixed(0)}，增益 ${s.gain.toFixed(2)}，声像 ${s.pan.toFixed(2)}`; };
+document.getElementById('px').oninput = updInfo; document.getElementById('py').oninput = updInfo; updInfo();
+
+// 预设按钮
+const groups = document.getElementById('groups');
+for (const [g, names] of Object.entries(PRESET_GROUPS)) {
+  const h = document.createElement('h2'); h.textContent = g; groups.append(h);
+  const row = document.createElement('div'); row.className = 'row';
+  for (const n of names) { const b = document.createElement('button'); b.textContent = n; b.onclick = () => play(n); row.append(b); }
+  groups.append(row);
+}
+
+// 环境音
+const ambBtn = document.getElementById('amb');
+ambBtn.onclick = () => { unlock(); ambOn = !ambOn; audio.setVolume({ ambient: ambOn ? 0.8 : 0 }); ambBtn.textContent = `环境音：${ambOn ? '开' : '关'}`; ambBtn.classList.toggle('on', ambOn); };
+
+// 回城
+let recall = null;
+const rb = document.getElementById('recall');
+rb.onclick = () => {
+  unlock();
+  if (recall) { recall.stop(); recall = null; audio.play('recallEnd'); rb.textContent = '开始回城'; return; }
+  recall = audio.engine?.startLoop('recall', LOOPS.recall, { gain: 0.8 }) || null;
+  rb.textContent = '结束回城';
+};
+
+// 语音
+const me = { team: 0, player };
+const vrow = document.getElementById('voices');
+for (const key of VOICE_KEYS) {
+  for (const team of [0, 1]) {
+    const line = lineFor(key, { key, team }, me);
+    if (!line) continue;
+    if (team === 1 && line.text === lineFor(key, { key, team: 0 }, me)?.text) continue;
+    const b = document.createElement('button'); b.textContent = `${key}：${line.text}`;
+    b.onclick = () => { unlock(); audio.announcer.recent.clear(); audio.say(line.text, line.priority); };
+    vrow.append(b);
+  }
+}
+for (const [label, p] of [['被击杀', { key: 'kill', team: 1, victim: player }], ['击杀敌人', { key: 'kill', team: 0, killer: player }]]) {
+  const line = lineFor('kill', p, me);
+  const b = document.createElement('button'); b.textContent = `${label}：${line.text}`;
+  b.onclick = () => { unlock(); audio.announcer.recent.clear(); audio.say(line.text, line.priority); };
+  vrow.append(b);
+}
+
+// 帧循环
+let last = performance.now();
+const loop = (now) => { const dt = (now - last) / 1000; last = now; game.time += dt; audio.update(dt); requestAnimationFrame(loop); };
+requestAnimationFrame(loop);
+
+// 自检入口：逐个调用所有预设 + 所有台词映射，返回统计
+window.__audioTest = {
+  audio,
+  playAll() {
+    audio.unlock();
+    const names = [...new Set(Object.values(PRESET_GROUPS).flat())];
+    let ok = 0; const failed = [];
+    for (const n of names) {
+      audio.engine && (audio.engine._last.clear(), audio.engine.voices.length = 0);
+      try { if (audio.play(n) || !audio.engine) ok++; else failed.push(n); } catch (e) { failed.push(`${n}:${e.message}`); }
+    }
+    const h = audio.engine?.startLoop('recall', LOOPS.recall, { gain: 0.5 }); h?.stop();
+    const lines = VOICE_KEYS.flatMap((k) => [0, 1].map((t) => lineFor(k, { key: k, team: t }, me)?.text));
+    game.events.emit('announce', { key: 'firstBlood', team: 0 });
+    audio.setVolume({ master: 0.5, sfx: 0.5, voice: 0.5, ambient: 0.5 }); audio.setMuted(true); audio.setMuted(false);
+    audio.update(0.016);
+    return { ctx: audio.ctx?.state ?? null, total: names.length, ok, failed, lines: lines.filter(Boolean).length, missing: lines.filter((x) => !x).length };
+  },
+};
+</script>
+</body>
+</html>

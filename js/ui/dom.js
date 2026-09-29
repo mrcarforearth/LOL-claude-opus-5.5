@@ -231,4 +231,4 @@ export function resolveVal(v, champ, rank) {
     return v ?? 0;
   } catch { return 0; }
 }
-export const RESOURCE_LABEL = { mana: '法力', energy: '能量', none: '', hp: '生命值', fury: '怒气' };
+export const RESOURCE_LABEL = { mana: '法力', energy: '能量', flow: '剑意', none: '', hp: '生命值', fury: '怒气' };

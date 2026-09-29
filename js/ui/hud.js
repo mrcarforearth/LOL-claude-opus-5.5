@@ -2,7 +2,7 @@
 import {
   h, esc, richText, fmtTime, fmtCd, fmtNum, setText, setStyle, toggle, safeDesc, RESOURCE_LABEL, ROLE_LABELS,
 } from './dom.js';
-import { iconURL, trinketIconURL, STAT_SVG, RECALL_ICON } from './icons.js';
+import { iconURL, trinketIconURL, STAT_SVG, RECALL_ICON, unitIconFor } from './icons.js';
 import { tipCard } from './tooltip.js';
 import { TRINKET } from '../config.js';
 
@@ -551,7 +551,7 @@ export class Hud {
       seen.add(b);
       let e = this.buffEls.get(b);
       if (!e) {
-        const img = h('img', { alt: '', src: iconURL(b.icon, 48, { glyph: (b.name || '?')[0] }) });
+        const img = h('img', { alt: '', src: iconURL(b.icon, 48, { glyph: (b.name || '?')[0], buffId: b.id }) });
         const time = h('span.bt.num'), stk = h('span.bs.num'), ring = h('i.bm');
         const root = h(`div.buff${b.isDebuff ? '.debuff' : ''}`, img, ring, time, stk);
         this.tip.bind(root, () => tipCard({
@@ -588,7 +588,8 @@ export class Hud {
       if (champId) { this.tImg.hidden = false; this.tGlyph.hidden = true; this.ui.portraits.apply(this.tImg, champId); }
       else {
         this.tImg.hidden = true; this.tGlyph.hidden = false;
-        this.tGlyph.textContent = (u.type === 'monster' && u.name ? u.name[0] : TYPE_GLYPH[u.type]) || '?';
+        const urel = u.team === pt ? 'ally' : u.team === 2 || u.type === 'monster' ? 'neutral' : 'enemy';
+        this.tGlyph.replaceChildren(h('img', { alt: '', draggable: 'false', src: unitIconFor(u, urel, 96, { frame: false }), style: { width: '100%', height: '100%', display: 'block', objectFit: 'cover' } }));
       }
       setText(this.tName, isChamp ? (u.def?.name || u.name) : (u.name || TYPE_GLYPH[u.type] || ''));
       const rel = u.team === pt ? 'ally' : u.team === 2 || u.type === 'monster' ? 'neutral' : 'enemy';

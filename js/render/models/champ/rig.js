@@ -1,6 +1,14 @@
-// 人形骨架 + 基础身体（躯干/四肢/头/五官）+ 头发、布料等通用部件
-// 骨骼：hips → spine → chest → head；chest → shL/shR → uaL/uaR → faL/faR → hdL/hdR → wpL/wpR；hips → thL/thR → snL/snR → ftL/ftR
+// 人形骨架（层级骨骼）+ 基础身体（躯干/四肢/头/五官）+ 头发、披风、尾巴等通用部件
+// 骨骼：hips（骨盆）→ spine（脊柱/腹）→ chest（胸）→ head（颈+头）；
+//       chest → shL/shR（肩）→ uaL/uaR（上臂）→ faL/faR（前臂）→ hdL/hdR（手）→ wpL/wpR（武器挂点，拳心，沿局部 +X 延伸）；
+//       hips → thL/thR（大腿）→ snL/snR（小腿）→ ftL/ftR（脚）。L = 左（-Z），R = 右（+Z）。
+// 链式骨骼（披风/尾巴/发辫/裙摆）用 bp.chain() / cape() / tail() 创建，并登记到 bp.meta.chains 由动画系统做次级摆动。
 import { geo, flipGeo, PI, TAU } from './kit.js';
+
+// 常用几何变体
+export const cylX = (rt, rb, len, s = 10) => { const g = geo.cyl(rt, rb, len, s); g.rotateZ(-PI / 2); return g; }; // 沿 X 轴的圆柱（握柄）
+export const cylZ = (rt, rb, len, s = 10) => { const g = geo.cyl(rt, rb, len, s); g.rotateX(PI / 2); return g; }; // 沿 Z 轴的圆柱
+export const ringY = (R, r, s = 20) => { const g = geo.tor(R, r, 6, s); g.rotateX(PI / 2); return g; };          // 绕 Y 轴的环（腰带/护颈）
 
 const DEF_PROP = { leg: 0.46, torso: 0.3, head: 0.088, shoulder: 0.125, hipW: 0.052, arm: 0.36, neck: 0.028 };
 
@@ -155,5 +163,15 @@ export function tail(bp, prefix, parent, pts, radiusFn, color, { n = 3, segs = 1
   const bpts = curveBonePts(curve, n, [0, 0, 0]);
   const names = bp.chain(prefix, parent, bpts);
   bp.add(names[0], g, color, { p: [-bpts[0][0], -bpts[0][1], -bpts[0][2]], chain: names, glow, c2, shine });
+  return names;
+}
+
+// 长发背片（双面布料，挂在 head 下的链式骨骼上），返回骨骼名数组（登记为 kind: 'hair'）
+export function hairSheet(bp, M, prefix, color, len, wTop, wBot, c2 = null) {
+  const R = M.headR, hc = M.headC;
+  const names = bp.chain(prefix, 'head', linePts([hc[0] - R * 0.82, hc[1] - R * 0.1, 0], [hc[0] - R * 1.0, hc[1] - R * 0.1 - len, 0], 3));
+  const g = geo.cloth(wTop, wBot, len, R * 0.25, 5, 7);
+  bp.add(names[0], g, color, { chain: names, c2 });
+  bp.add(names[0], geo.cloth(wTop * 0.96, wBot * 0.96, len * 0.98, R * 0.2, 5, 7), color, { p: [0.8, 0, 0], r: [0, PI, 0], chain: names, c2 });
   return names;
 }

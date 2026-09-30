@@ -143,6 +143,31 @@ test('小兵优先级：小兵优先于英雄；呼叫支援立即转火', () =>
   assert(bm.targetPriority === 1, '优先级 1');
 });
 
+test('小兵英雄仇恨：拉开距离后脱离，不再一直跟随；再次挑衅会重新锁定', () => {
+  const game = makeGame({ open: true, waves: false });
+  const bm = laneMinion(game, 0, 'melee', 7000, 7000);
+  bm.waypoints = [[6000, 6000], [9000, 9000]];
+  const rc = spawnDummy(game, { team: 1, x: 7150, y: 7150, hp: 50000 });
+  const bc = spawnDummy(game, { team: 0, x: 6950, y: 7000, hp: 50000 });
+  game.dealDamage(rc, bc, 10, 'physical');
+  run(game, 0.4);
+  assert(bm.command && bm.command.target === rc, '呼叫支援后锁定敌方英雄');
+  // 敌方英雄沿兵线方向逃离（比近战兵快），不再攻击
+  rc.baseStats.ms = 420; rc.recalcStats?.();
+  rc.moveTo(8600, 8600);
+  run(game, 2.2);
+  const chasing = bm.command && bm.command.type === 'attack' && bm.command.target === rc;
+  assert(!chasing, '英雄拉开距离后小兵脱离仇恨');
+  assert(bm._laneWalking || (bm.command && bm.command.target !== rc), '脱离后回到兵线行进（或转攻其他目标）');
+  // 忽略窗口内不会重新主动锁定该英雄；再次攻击我方英雄会重新锁定
+  rc.stop(); rc.setPosition(bm.x + 150, bm.y + 150); bc.setPosition(bm.x - 100, bm.y);
+  run(game, 0.5);
+  assert(!(bm.command && bm.command.target === rc), '忽略窗口内不主动锁定刚脱离的英雄');
+  game.dealDamage(rc, bc, 10, 'physical');
+  run(game, 0.4);
+  assert(bm.command && bm.command.target === rc, '再次挑衅后重新锁定');
+});
+
 test('小兵优先级：攻击我方小兵的敌方英雄 > 最近的敌方小兵；追击不超过兵线 800', () => {
   const game = makeGame({ open: true, waves: false });
   const victim = laneMinion(game, 0, 'melee', 7100, 7100);

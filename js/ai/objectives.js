@@ -4,10 +4,10 @@ import { findControlWardSlot } from './shopping.js';
 
 export const ObjectiveMixin = {
   // 沿某路推进/对线（通用）：补刀 → 推线 → 站位
-  _followLane(lane, { push = false } = {}) {
+  _followLane(lane, { push = false, hold = false } = {}) {
     const c = this.champ;
     this.mode = push ? 'pushing' : 'laning';
-    const pos = this._lanePosition(lane, { push });
+    const pos = this._lanePosition(lane, { push, hold });
     const far = Math.hypot(pos.x - c.x, pos.y - c.y);
     if (far > 1800) {
       // 远离兵线：先赶路（路上遇到可补的兵照补）
@@ -15,6 +15,7 @@ export const ObjectiveMixin = {
       return;
     }
     if (!push && this._tryHarass(lane)) return;
+    if (this._avoidPoke(lane)) return;
     if (this._laneFarm(lane, { push })) return;
     this.goTo(pos.x, pos.y, { tol: 70 });
   },
@@ -29,6 +30,18 @@ export const ObjectiveMixin = {
     const far = Math.hypot(pos.x - c.x, pos.y - c.y);
     if (far > 2200) { this._travel(pos.x, pos.y); return; }
     const next = this.world.nextEnemyStructure(c.team, lane);
+    // 劣势：守在己方半场清线，不去推塔
+    if (obj.hold && !obj.end) {
+      this.mode = 'laning';
+      this._followLane(lane, { push: false, hold: true });
+      return;
+    }
+    // 高地推进时机：下一个目标在敌方基地（高地塔/水晶/枢纽）且时机未到 → 只清线不上高地
+    const baseTier = next && (next.type === 'inhibitor' || next.type === 'nexus' || next.tier === 'inhib' || next.tier === 'nexus');
+    if (baseTier && !obj.siegeOk && !obj.end) {
+      this._followLane(lane, { push: false });
+      return;
+    }
     let grouped = 1;
     for (const a of this.allies) if (a.d < 1500) grouped++;
     const defenders = next ? brain.enemiesKnownNear(next.x, next.y, 2500, 6) : 0;
@@ -169,7 +182,8 @@ export const ObjectiveMixin = {
   _supportLane() {
     const c = this.champ;
     const adc = this._adc();
-    const lane = 'bot';
+    const adcAI = this.brain.members.find((m) => m.role === 'adc');
+    const lane = (adcAI && this.brain.laneFor(adcAI)) || 'bot';
     this.mode = 'laning';
     if (adc && !adc.isRecalling && !adc.inFountain && adc.distTo(c) < 3500) {
       if (this._tryHarass(lane)) return;

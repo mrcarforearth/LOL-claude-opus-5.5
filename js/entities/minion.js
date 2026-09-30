@@ -22,6 +22,11 @@ export const ACQUIRE_RANGE = 700;          // 获取目标半径
 export const LANE_LEASH = 800;             // 离兵线路径的最大追击距离
 export const CALL_FOR_HELP_RANGE = 1000;   // 响应呼叫支援时我方英雄与小兵的最大距离
 export const THINK_INTERVAL = 0.25;
+// 英雄仇恨（LoL：拉开距离或一段时间不再挑衅后小兵放弃追击英雄）
+export const CHAMP_AGGRO_LEASH = 450;      // 从开始追击英雄的位置起，最多追出的距离
+export const CHAMP_AGGRO_OUT_RANGE = 1.0;  // 英雄离开攻击范围且未再挑衅超过此时间 → 放弃
+export const CHAMP_AGGRO_TIMEOUT = 3.0;    // 超过此时间未再挑衅 → 若有其他可攻击目标则转火
+export const CHAMP_AGGRO_IGNORE = 2.5;     // 放弃后在此时间内不再主动锁定该英雄（除非再次攻击我方英雄）
 export const EMPOWER_RANGE = 1100;         // 纳什男爵之手：强化附近友方小兵的半径
 // 纳什男爵强化后的额外属性
 export const EMPOWER_STATS = {
@@ -101,6 +106,9 @@ export class Minion extends Unit {
     this.targetPriority = 99;         // 当前目标的优先级（1 最高）
     this._laneWalking = false;
     this._helpSet = new Set();
+    this._helpTime = new Map();       // 呼叫支援的敌方英雄 → 最近一次伤害我方英雄的时间
+    this._aggro = null;               // 当前英雄仇恨 { unit, x, y, provokedAt, outSince }
+    this._ignoreChamp = new Map();    // 英雄 id → { until, at }：脱离仇恨后的忽略窗口
     this._nextThink = game.time + (this.id % 8) * 0.03;
   }
 
@@ -114,6 +122,8 @@ export class Minion extends Unit {
   _callsForHelp(now) {
     const set = this._helpSet;
     set.clear();
+    const times = this._helpTime;
+    times.clear();
     const champs = this.game.champions;
     for (let i = 0; i < champs.length; i++) {
       const c = champs[i];
@@ -123,6 +133,8 @@ export class Minion extends Unit {
       if (!e || !e.alive || e.team === this.team) continue;
       if (this.distTo(c) > CALL_FOR_HELP_RANGE) continue;
       set.add(e);
+      const t = c.lastChampionDamageAt ?? -99;
+      if (t > (times.get(e) ?? -99)) times.set(e, t);
     }
     return set;
   }
@@ -161,7 +173,7 @@ export class Minion extends Unit {
   }
 
   // 扫描获取半径内的最佳目标：{ unit, prio } | null
-  _scan(helpers, now) {
+  _scan(helpers, now, noChamps = false) {
     const list = this.game.queryUnits({
       x: this.x, y: this.y, radius: ACQUIRE_RANGE, enemyOf: this, targetableBy: this, types: TARGET_TYPES, sort: false,
       filter: (u) => this._isCandidate(u),
@@ -171,6 +183,10 @@ export class Minion extends Unit {
       const u = list[i];
       if (!u.isStructure && this.laneDistance(u.x, u.y) > LANE_LEASH) continue;
       const p = this._priorityOf(u, helpers, now);
+      if (u.type === 'champion' && this._isIgnored(u, p, now)) continue;
+      if (noChamps && u.type === 'champion') continue;
+      // 未被挑衅时（优先级 7）只锁定身边的英雄，不去追远处路过/逃跑的英雄
+      if (u.type === 'champion' && p >= 7 && u._qd > (this.stats.attackRange + (u.radius || 0) + 300) ** 2) continue;
       const d = u._qd;
       if (p < bp || (p === bp && d < bd)) { best = u; bp = p; bd = d; }
     }
@@ -188,7 +204,42 @@ export class Minion extends Unit {
     return true;
   }
 
+  // 刚脱离仇恨的英雄：忽略窗口内只有「脱离之后又攻击了我方英雄」才重新锁定
+  _isIgnored(u, prio, now) {
+    const ig = this._ignoreChamp.get(u.id);
+    if (!ig) return false;
+    if (now >= ig.until) { this._ignoreChamp.delete(u.id); return false; }
+    return !(prio <= 1 && (this._helpTime.get(u) ?? -99) > ig.at);
+  }
+
+  // 放弃当前英雄仇恨
+  _dropChampAggro(t, now) {
+    this._ignoreChamp.set(t.id, { until: now + CHAMP_AGGRO_IGNORE, at: now });
+    this._aggro = null;
+    this.command = null;
+    this.attackState = null;
+    this.attackTarget = null;
+    this.targetPriority = 99;
+  }
+
+  // 英雄仇恨是否应当结束：追太远 / 离开攻击范围且不再挑衅
+  _champAggroExpired(t, cp, now) {
+    let ag = this._aggro;
+    if (!ag || ag.unit !== t) ag = this._aggro = { unit: t, x: this.x, y: this.y, provokedAt: now, outSince: null };
+    if (cp < 6) ag.provokedAt = now;                 // 仍在攻击我方英雄/小兵：刷新仇恨
+    const inRange = this.inAttackRange(t) || this.edgeDist(t) <= this.stats.attackRange + 60;
+    if (inRange) ag.outSince = null;
+    else if (ag.outSince === null) ag.outSince = now;
+    const calm = now - ag.provokedAt;
+    const chased = Math.hypot(this.x - ag.x, this.y - ag.y);
+    if (!inRange && chased > CHAMP_AGGRO_LEASH) return true;
+    if (!inRange && now - ag.outSince > CHAMP_AGGRO_OUT_RANGE && calm > CHAMP_AGGRO_OUT_RANGE) return true;
+    return false;
+  }
+
   _engage(u, prio) {
+    const now = this.game.time;
+    this._aggro = u.type === 'champion' ? { unit: u, x: this.x, y: this.y, provokedAt: now, outSince: null } : null;
     this.targetPriority = prio;
     this._laneWalking = false;
     this.attackUnit(u);
@@ -261,6 +312,19 @@ export class Minion extends Unit {
       // 已有目标：只有呼叫支援（优先级 1/2）能让小兵转火
       const cp = this._priorityOf(cur, helpers, now);
       this.targetPriority = cp;
+      if (cur.type === 'champion') {
+        if (this._champAggroExpired(cur, cp, now)) {
+          this._dropChampAggro(cur, now);
+          const best = selfLane <= LANE_LEASH + 50 ? this._scan(helpers, now) : null;
+          if (best) this._engage(best.unit, best.prio); else this._walkLane();
+          return;
+        }
+        // 长时间未再挑衅：附近有小兵/建筑可打就转火
+        if (cp >= 6 && now - this._aggro.provokedAt > CHAMP_AGGRO_TIMEOUT) {
+          const alt = this._scan(helpers, now, true);
+          if (alt) { this._ignoreChamp.set(cur.id, { until: now + CHAMP_AGGRO_IGNORE, at: now }); this._engage(alt.unit, alt.prio); return; }
+        }
+      } else this._aggro = null;
       if (cp <= 1) return;
       if (helpers.size === 0 && !this._allyChampNear()) return;
       const best = this._scan(helpers, now);

@@ -37,6 +37,13 @@ export class TeamBrain {
     this.nextSeen = 0;
     this.lastTeamfightAt = -99;
     this.dragonsTaken = 0;
+    this.fightSpot = null;          // 正在进行的团战位置 { x, y, t, allies, enemies }
+    this.focus = null;              // 团队集火目标
+    this.nextFocus = 0;
+    this.waveThreat = { top: null, mid: null, bot: null };   // 敌方兵线压到我方建筑（无人防守）
+    this.defenders = new Map();     // 兵线防守分配：lane → { ai, until }
+    this.laneSwap = null;           // 中期换线：{ since }（下路组合转中、中单去下路）
+    this.splitSince = -99;
     for (const c of this.world.camps) {
       let at = c.firstSpawn ?? TIMINGS.JUNGLE_SPAWN;
       if (c.kind === 'dragon') at = Math.max(at, TIMINGS.DRAGON_SPAWN);
@@ -144,6 +151,55 @@ export class TeamBrain {
     if (now >= this.nextSeen) { this.nextSeen = now + 0.2; this._updateSeen(); }
     if (now >= this.nextWave) { this.nextWave = now + WAVE_INTERVAL; this._updateWaves(); }
     if (now >= this.nextPlan) { this.nextPlan = now + PLAN_INTERVAL; this._plan(); }
+    if (now >= this.nextFocus) { this.nextFocus = now + 0.3; this._updateFight(); }
+  }
+
+  // 团战感知：多名队友交战的位置（供附近队友集结），以及团队集火目标（有效生命低 × 威胁高 × 被控 × 多人可打到）
+  _updateFight() {
+    const now = this.game.time;
+    let fx = 0, fy = 0, n = 0;
+    for (const a of this.members) {
+      const c = a.champ;
+      if (!c.alive || a.mode !== 'fighting' || !a.target || a.target.type !== 'champion') continue;
+      fx += c.x; fy += c.y; n++;
+    }
+    if (n >= 1) {
+      fx /= n; fy /= n;
+      let enemies = 0;
+      for (const e of this.game.champions) {
+        if (e.team === this.team || !e.alive || !e.visible[this.team]) continue;
+        if ((e.x - fx) ** 2 + (e.y - fy) ** 2 < 1600 * 1600) enemies++;
+      }
+      if (enemies >= 1 && (n >= 2 || enemies >= 2)) {
+        this.fightSpot = { x: fx, y: fy, t: now, allies: n, enemies };
+        this.lastTeamfightAt = n + enemies >= 4 ? now : this.lastTeamfightAt;
+      }
+    }
+    if (this.fightSpot && now - this.fightSpot.t > 3) this.fightSpot = null;
+    // 集火目标
+    let best = null, bs = 0;
+    for (const e of this.game.champions) {
+      if (e.team === this.team || !e.alive || !e.visible[this.team] || e.untargetable) continue;
+      let sc = 0, k = 0;
+      for (const a of this.members) {
+        const c = a.champ;
+        if (!c.alive) continue;
+        const d = Math.hypot(c.x - e.x, c.y - e.y);
+        const reach = c.stats.attackRange + c.radius + e.radius + 250;
+        if (d > Math.max(reach, 900)) continue;
+        k++;
+        sc += d <= reach ? 1 : 0.5;
+      }
+      if (k === 0) continue;
+      const s = e.stats;
+      const ehp = (e.hp + (e.totalShield || 0)) * (1 + ((s.armor || 0) + (s.mr || 0)) / 200);
+      const pri = { adc: 1.35, mid: 1.25, jungle: 1.05, top: 0.95, support: 0.85 }[e.role] ?? 1;
+      let v = sc * pri * 1000 / Math.max(150, ehp);
+      if (e.isHardCCd?.()) v *= 1.3;
+      if (this.focus === e) v *= 1.25;  // 集火粘性
+      if (v > bs) { bs = v; best = e; }
+    }
+    this.focus = best;
   }
 
   _updateSeen() {
@@ -250,16 +306,40 @@ export class TeamBrain {
     return n >= 2 ? n : 0;
   }
 
+  // 团队实力（等级、装备、当前生命）：用于优劣势评估（记分板信息，敌方用最近一次看到的生命）
+  teamPower(team) {
+    let p = 0;
+    for (const c of this.game.champions) {
+      if (c.team !== team || !c.alive) continue;
+      const items = c.items ? c.items.filter(Boolean).length : 0;
+      let hpPct = c.hp / Math.max(1, c.maxHp);
+      if (team !== this.team) { const s = this.enemySeen.get(c); hpPct = s ? Math.min(1, s.hp / Math.max(1, s.maxHp) + (this.game.time - s.t) * 0.01) : 1; }
+      p += (c.level + items * 1.6 + 4) * (0.45 + 0.55 * hpPct);
+    }
+    return p;
+  }
+
+  // 史诗野怪是否在 win 秒内刷新（用于提前集结布置）
+  _spawnSoon(def, win) {
+    if (!def) return false;
+    const st = this.camps.get(def.id);
+    if (!st || st.gone) return false;
+    const at = st.respawnAt;
+    return !this.campUp(def) && at - this.game.time <= win && at > this.game.time;
+  }
+
   _plan() {
     const game = this.game;
     const now = game.time;
     const { ours, theirs } = this.aliveCounts();
-    const adv = ours - theirs;
     const advEff = this.effectiveAdvantage();
     this.advEff = advEff;
     const prev = this.objective;
     const late = this.isLateGame();
     const baseOpen = this.enemyBaseOpen();
+    const pr = this.teamPower(this.team) / Math.max(1, this.teamPower(1 - this.team));
+    this.powerRatio = pr;
+    const baronBuff = (game.teams?.[this.team]?.baronUntil ?? -1) > now;
     let obj = null;
 
     // 0) 残局：敌方基地已开且人数优势明显 → 直接推家（优先于男爵/小龙）
@@ -267,9 +347,7 @@ export class TeamBrain {
 
     // 1) 防守：敌方英雄出现在我方建筑附近
     const threat = this._structureThreat();
-    // 对线期：敌方双人路压到外塔/内塔属于正常对线，不全队回防；3 人以上（越塔/抱团）才回防
     const earlyLaneThreat = threat && !late && threat.structure.type === 'turret' && (threat.structure.tier === 'outer' || threat.structure.tier === 'inner') && threat.count < 3;
-    // 残局推家时只有基地被多人威胁才回防（拆家对拼）
     const ignoreThreat = endgame && threat && (threat.count <= 1 || (!threat.base && advEff >= 2));
     if (threat && (threat.count >= 2 || threat.base) && !earlyLaneThreat && !ignoreThreat) {
       obj = { kind: 'defend', x: threat.x, y: threat.y, lane: threat.lane, structure: threat.structure, since: now, all: threat.base || threat.count >= 3 };
@@ -277,38 +355,43 @@ export class TeamBrain {
 
     if (!obj && endgame) {
       const lane = this._chooseGroupLane(advEff, theirs, true);
-      obj = { kind: 'push', lane, since: prev?.kind === 'push' && prev.lane === lane ? prev.since : now, all: true, end: true };
+      obj = { kind: 'push', lane, since: now, all: true, end: true, siegeOk: true };
     }
 
-    // 2) 纳什男爵
+    // 2) 纳什男爵（含刷新前 45 秒集结布置）
     const baronDef = this._campByKind('baron');
-    if (!obj && baronDef && now >= TIMINGS.BARON_SPAWN && this.campUp(baronDef)) {
+    if (!obj && baronDef && now >= TIMINGS.BARON_SPAWN - 45) {
+      const up = this.campUp(baronDef);
       const enemyNear = this.enemiesKnownNear(baronDef.x, baronDef.y, 2500, 10);
-      const onIt = this._enemyOnEpic(baronDef);
-      if ((advEff >= 2 || (theirs <= 2 && ours >= 3)) && enemyNear <= Math.max(0, ours - 3)) obj = { kind: 'baron', x: baronDef.x, y: baronDef.y, camp: baronDef, since: now, all: true };
-      // 争夺：敌方在打男爵，我方人数不劣 → 全队去抢/打团
-      else if (onIt && ours >= 3 && ours >= onIt) obj = { kind: 'baron', x: baronDef.x, y: baronDef.y, camp: baronDef, since: prev?.kind === 'baron' ? prev.since : now, all: true, contest: true };
-      else if (prev?.kind === 'baron' && advEff >= 1 && enemyNear === 0) obj = prev;
+      const onIt = up ? this._enemyOnEpic(baronDef) : 0;
+      const strong = advEff >= 2 || (theirs <= 2 && ours >= 3) || (advEff >= 1 && pr > 1.2);
+      if (up && strong && enemyNear <= Math.max(0, ours - 3)) obj = { kind: 'baron', x: baronDef.x, y: baronDef.y, camp: baronDef, since: now, all: true };
+      else if (up && onIt && ours >= 3 && ours >= onIt) obj = { kind: 'baron', x: baronDef.x, y: baronDef.y, camp: baronDef, since: now, all: true, contest: true };
+      else if (this._spawnSoon(baronDef, 45) && advEff >= 0 && pr > 1.05 && ours >= 4) obj = { kind: 'baron', x: baronDef.x, y: baronDef.y, camp: baronDef, since: now, all: true, setup: true };
+      else if (prev?.kind === 'baron' && this._epicInProgress(baronDef) && advEff >= 0) obj = prev;
     }
 
-    // 3) 元素亚龙
+    // 3) 元素亚龙（含刷新前 40 秒集结布置）
     const dragonDef = this._campByKind('dragon');
-    if (!obj && dragonDef && this.campUp(dragonDef)) {
+    if (!obj && dragonDef) {
+      const up = this.campUp(dragonDef);
+      const soon = this._spawnSoon(dragonDef, 40);
       const enemyNear = this.enemiesKnownNear(dragonDef.x, dragonDef.y, 3000, 10);
-      const onIt = this._enemyOnEpic(dragonDef);
+      const onIt = up ? this._enemyOnEpic(dragonDef) : 0;
       if (late) {
-        if (advEff >= 1 || (advEff >= 0 && enemyNear === 0 && ours >= 4)) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: true };
-        else if (onIt && ours >= 3 && ours >= onIt) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: true, contest: true };
-      } else {
+        const good = advEff >= 1 || (advEff >= 0 && (enemyNear === 0 || pr > 1.1) && ours >= 4);
+        if (up && good) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: true };
+        else if (up && onIt && ours >= 3 && ours >= onIt) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: true, contest: true };
+        else if (soon && advEff >= 0 && pr > 0.9 && ours >= 4) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: true, setup: true };
+      } else if (up || soon) {
         // 前期：打野 5 级以上、下路至少一人 4 级以上且状态良好才去
         const jg = this.members.find((a) => a.role === 'jungle' && a.champ.alive && a.champ.hpPct > 0.5 && a.champ.level >= 5);
         const bot = this.members.filter((a) => (a.role === 'adc' || a.role === 'support') && a.champ.alive && a.champ.hpPct > 0.5 && a.champ.level >= 4);
         const roles = ['jungle', 'adc', 'support', 'mid'];
-        if (jg && bot.length >= 1 && enemyNear <= bot.length) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: false, roles };
-        // 争夺：敌方打野/下路在打龙，我方打野与下路都在 → 去抢
-        else if (onIt && jg && bot.length >= 1 && onIt <= bot.length + 1) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: false, roles, contest: true };
+        if (jg && bot.length >= 1 && enemyNear <= bot.length && pr > 0.85) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: false, roles, setup: !up };
+        else if (up && onIt && jg && bot.length >= 1 && onIt <= bot.length + 1) obj = { kind: 'dragon', x: dragonDef.x, y: dragonDef.y, camp: dragonDef, since: now, all: false, roles, contest: true };
       }
-      if (!obj && prev?.kind === 'dragon' && enemyNear <= 1) obj = prev;
+      if (!obj && prev?.kind === 'dragon' && this._epicInProgress(dragonDef) && enemyNear <= 2) obj = prev;
     }
 
     // 4) 峡谷先锋（前期，上半区）
@@ -320,21 +403,130 @@ export class TeamBrain {
       else if (prev?.kind === 'herald' && enemyNear <= 1) obj = prev;
     }
 
-    // 5) 中后期：抱团推进（人数优势 / 敌方基地已开 / 27 分钟后全员参与）
+    // 5) 中后期：抱团推进（人数优势 / 敌方基地已开 / 20 分钟后全员参与）；明显劣势时守塔清线
     if (!obj && late) {
       const lane = this._chooseGroupLane(advEff, theirs, false);
-      const all = advEff >= 1 || theirs <= 3 || baseOpen || now >= 27 * 60;
-      obj = { kind: 'push', lane, since: prev?.kind === 'push' && prev.lane === lane ? prev.since : now, all };
+      const all = advEff >= 1 || theirs <= 3 || baseOpen || now >= 20 * 60 || (prev?.kind === 'push' && prev.all && advEff >= 0);
+      // 高地推进时机：人数优势 2+、男爵 Buff、基地已开、己方超级兵、或 30 分钟后
+      const siegeOk = advEff >= 2 || baronBuff || baseOpen || (advEff >= 1 && pr > 1.4) || this._superWave(lane) || now >= 30 * 60;
+      const behind = advEff <= -1 || (advEff <= 0 && pr < 0.78);
+      obj = { kind: 'push', lane, since: now, all, siegeOk, hold: behind && !baronBuff };
     }
+
+    obj = this._commit(obj, prev, advEff);
+    if (obj && obj !== prev) obj.setAt = now;
     this.objective = obj;
     if (obj && obj.kind === 'push' && obj.all && advEff >= 2) this.lastPressAt = now;
 
-    // 分推人选：中后期上单（生命值健康）走另一条边路；团队全力推进时不分推
-    this.splitPusher = null;
-    if (obj && obj.kind === 'push' && !obj.all && now >= 16 * 60) {
-      const top = this.members.find((a) => a.role === 'top' && a.champ.alive && a.champ.hpPct > 0.5);
-      if (top) this.splitPusher = top;
+    // 分推人选：中后期上单（生命值健康）走另一条边路；团队全力推进时不分推；有承诺时间，避免反复切换
+    const top = this.members.find((a) => a.role === 'top' && a.champ.alive && a.champ.hpPct > 0.4);
+    const wantSplit = obj && obj.kind === 'push' && !obj.all && now >= 16 * 60 && top;
+    if (wantSplit) { if (this.splitPusher !== top) { this.splitPusher = top; this.splitSince = now; } }
+    else if (this.splitPusher && (!this.splitPusher.champ.alive || now - this.splitSince > 30 || !obj || obj.kind !== 'push' || obj.end || obj.hold)) this.splitPusher = null;
+
+    this._updateWaveThreats(late);
+    this._updateLaneSwap(late);
+  }
+
+  // 目标承诺：新目标需在旧目标持续一段时间且旧目标失效后才替换（紧急防守/残局/抢龙除外），避免全队来回跑
+  _commit(obj, prev, advEff) {
+    const now = this.game.time;
+    if (!prev) return obj;
+    if (obj && obj.kind === prev.kind && obj.lane === prev.lane && obj.camp === prev.camp) {
+      obj.since = prev.since; obj.setAt = prev.setAt;
+      return obj;
     }
+    if (obj && (obj.end || obj.contest)) return obj;
+    if (obj && obj.kind === 'defend' && (obj.all || obj.structure?.type !== 'turret' || obj.structure?.tier === 'inhib' || obj.structure?.tier === 'nexus')) return obj;
+    const age = now - (prev.setAt ?? prev.since ?? now);
+    const hold = { push: 18, dragon: 22, baron: 22, herald: 18, defend: 8 }[prev.kind] ?? 10;
+    if (age < hold && this._objValid(prev, advEff)) return prev;
+    return obj;
+  }
+  _objValid(o, advEff) {
+    const now = this.game.time;
+    if (o.kind === 'dragon' || o.kind === 'baron' || o.kind === 'herald') {
+      if (advEff <= -2) return false;
+      if (this.campUp(o.camp) || this.campMonsters(o.camp).length) return true;
+      return !!o.setup && this.campRespawnAt(o.camp) - now < 50 && this.campRespawnAt(o.camp) > now - 5;
+    }
+    if (o.kind === 'push') return !!this.world.nextEnemyStructure(this.team, o.lane) && advEff > -2;
+    if (o.kind === 'defend') return !!o.structure?.alive;
+    return true;
+  }
+
+  // 我方正在打该史诗野怪（野怪掉血且仇恨在我方）
+  _epicInProgress(def) {
+    for (const m of this.campMonsters(def)) {
+      if (!m.visible?.[this.team]) continue;
+      if (m.hp < m.maxHp * 0.97 && m.aggroTarget && m.aggroTarget.team === this.team) return true;
+    }
+    return false;
+  }
+
+  // 该路是否有己方超级兵 / 男爵强化兵正在推进
+  _superWave(lane) {
+    for (const m of this.game.minions) {
+      if (!m.alive || m.team !== this.team || m.lane !== lane) continue;
+      if (m.kind === 'super' || m.empowered) return true;
+    }
+    return false;
+  }
+
+  // 兵线防守：敌方兵线（≥3 个）压到我方塔/水晶附近且附近没有我方小兵 → 记录威胁，分配最近的空闲队友回防
+  _updateWaveThreats(late) {
+    const w = this.world;
+    const now = this.game.time;
+    for (const lane of LANES) {
+      const wv = this.waves[lane];
+      const own = w.frontStructure(this.team, lane) || w.nexusTurrets[this.team]?.find((t) => t.alive) || null;
+      let th = null;
+      if (own && wv.enemyFront != null && wv.enemyNearFront >= 3) {
+        const ownF = w.toF(this.team, lane, w.structureS(own) ?? w.project(lane, own.x, own.y));
+        const allyHere = wv.allyFront != null && wv.allyFront > wv.enemyFront - 700;
+        if (wv.enemyFront < ownF + 900 && (!allyHere || wv.allyNearFront <= 1)) th = { lane, structure: own, f: wv.enemyFront, n: wv.enemyNearFront, t: now };
+      }
+      this.waveThreat[lane] = th;
+      const cur = this.defenders.get(lane);
+      if (!th) { if (cur && now > cur.until) this.defenders.delete(lane); continue; }
+      if (cur && cur.ai.champ.alive && now < cur.until) continue;
+      if (!late) { this.defenders.delete(lane); continue; }   // 对线期由各路自己处理
+      // 选择防守者：离得近、状态好、不在交战；优先分推者/上单/中单
+      let best = null, bs = Infinity;
+      for (const a of this.members) {
+        const c = a.champ;
+        if (!c.alive || c.hpPct < 0.4 || a.mode === 'fighting' || a.role === 'support') continue;
+        if ([...this.defenders.values()].some((d) => d.ai === a && d.lane !== lane)) continue;
+        let d = Math.hypot(c.x - th.structure.x, c.y - th.structure.y);
+        if (a === this.splitPusher) d *= 0.6;
+        if (a.role === 'top' || a.role === 'mid') d *= 0.85;
+        if (d < bs) { bs = d; best = a; }
+      }
+      if (best && bs < 9000) this.defenders.set(lane, { ai: best, lane, until: now + 20 });
+    }
+  }
+  defenderLane(ai) {
+    for (const [lane, d] of this.defenders) if (d.ai === ai && this.game.time < d.until && this.waveThreat[lane]) return lane;
+    return null;
+  }
+
+  // 中期换线（LoL 常见节奏）：我方下路推掉敌方下路外塔后，下路组合转中路推中塔，中单去下路发育
+  _updateLaneSwap(late) {
+    const now = this.game.time;
+    if (late || now < 8 * 60) { this.laneSwap = null; return; }
+    if (this.laneSwap) return;
+    const w = this.world;
+    const botOuter = w.laneStructs[1 - this.team].bot.find((s) => s.type === 'turret' && s.tier === 'outer');
+    const midOuter = w.laneStructs[1 - this.team].mid.find((s) => s.type === 'turret' && s.tier === 'outer');
+    if (botOuter && !botOuter.alive && midOuter && midOuter.alive) this.laneSwap = { since: now };
+  }
+  // 某成员当前应去的兵线
+  laneFor(ai) {
+    if (this.laneSwap && !this.isLateGame()) {
+      if (ai.role === 'adc' || ai.role === 'support') return 'mid';
+      if (ai.role === 'mid') return 'bot';
+    }
+    return ai.lane;
   }
 
   // 乘胜追击：刚打赢团战 / 残局推家时，不因金币或中等血量回城
@@ -366,6 +558,8 @@ export class TeamBrain {
       const wv = this.waves[lane];
       if (wv.allyFront != null) score += (wv.allyFront / w.laneLength(lane)) * 1.5;
       if (lane === 'mid') score += 1.0;
+      // 己方超级兵 / 男爵强化兵线：跟进推进
+      if (this._superWave(lane)) score += 1.6;
       if (!end && lane === 'bot') {
         const dr = this._campByKind('dragon');
         if (dr && this.campUp(dr)) score += 0.4;

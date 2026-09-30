@@ -1,5 +1,7 @@
 // AI 打野（控制器混入）：清野路线（出生侧 BUFF 开 → 按距离与价值）、惩戒、抓人（从草丛/河道接近）、迅捷蟹
 import { TIMINGS } from '../config.js';
+import { mitigate } from '../core/damage.js';
+import { autoDamage } from './combat.js';
 
 const CAMP_VALUE = { blue: 3.2, red: 3.2, gromp: 1.7, wolves: 1.5, raptors: 1.7, krugs: 1.9, scuttle_top: 2.2, scuttle_bot: 2.2 };
 const EPIC = new Set(['dragon', 'baron', 'herald']);
@@ -38,6 +40,8 @@ export const JungleMixin = {
       let use = epic || buff;
       if (!use && kind && kind.startsWith('scuttle')) use = charges >= 2 || this.hpPct() < 0.6;
       if (!use && (charges >= 2 || this.hpPct() < 0.45)) use = this.game.time < TIMINGS.DRAGON_SPAWN - 60 || charges >= 2;
+      // 残血清野：用惩戒回血保命（避免被野怪打死或被迫撤离让野怪重置）
+      if (!use && this.hpPct() < 0.3) use = true;
       if (!use) continue;
       const r = c.castSummoner(k, { target: m });
       if (r.ok) return true;
@@ -81,6 +85,8 @@ export const JungleMixin = {
       const wait = up ? 0 : Math.max(0, respawnAt - now - travel);
       if (!up && wait > 25) continue;
       let value = CAMP_VALUE[camp.kind] ?? 1.2;
+      // 血量不够打完这个营地（按看到的野怪估计）：降低优先级，避免打到一半被迫回城让野怪重置
+      if (this._campTooHard(camp)) value *= 0.15;
       if (camp.side !== c.team && !scuttle) value *= 1.3;
       if (scuttle && this.scuttleTaken?.[camp.id]) value *= 0.8;
       // 危险：敌方英雄最近出现在附近
@@ -90,6 +96,20 @@ export const JungleMixin = {
       if (score > bs) { bs = score; best = camp; }
     }
     return best;
+  },
+
+  // 估计清完营地会损失的生命是否超过当前可用生命（只用可见野怪；看不到时按保守值）
+  _campTooHard(camp) {
+    const c = this.champ;
+    const mons = this.brain.campMonsters(camp).filter((m) => m.visible?.[c.team]);
+    const spare = c.hp - c.maxHp * 0.25;
+    if (!mons.length) return spare < c.maxHp * 0.25 && !camp.kind.startsWith('scuttle');
+    let hp = 0, dps = 0;
+    for (const m of mons) { hp += m.hp; dps += mitigate(m, c, m.stats.ad, 'physical') * Math.max(0.2, m.stats.attackSpeed); }
+    const my = autoDamage(c, mons[0]) * c.stats.attackSpeed * 1.25 + c.level * 8 + 10;
+    const ttk = hp / Math.max(1, my);
+    // 伤害随野怪死亡递减（约一半）
+    return dps * ttk * 0.7 > spare;
   },
 
   // 打野主循环

@@ -47,6 +47,8 @@ export class ChampionAI {
     this.retreatHp = 0.5 - agg * 0.3;
     this.engageFactor = 0.8 + agg * 0.5;
     this.harassMana = 0.62 - agg * 0.2;
+    // 综合熟练度 0（新手）~ 1（困难）：用于补刀、集火、脱离仇恨、技能衔接等难度差异
+    this.skill = Math.max(0, Math.min(1, (this.params.lastHit - 0.55) / 0.4));
     // 感知与状态
     this.enemies = [];
     this.allies = [];
@@ -96,6 +98,7 @@ export class ChampionAI {
     const c = this.champ;
     const team = c.team;
     const out = [];
+    if (this._maskEnemies) return out;
     for (const e of this.game.champions) {
       if (e.team === team || !e.alive || !e.visible[team] || e.untargetable) continue;
       const d = c.distTo(e);
@@ -279,6 +282,7 @@ export class ChampionAI {
     this.gank = null;
     this.lhWatch = null;
     this.diving = false;
+    this.pushToRecall = false;
     this._wasAlive = false;
     if (now >= this.nextDeadShopAt) { this.nextDeadShopAt = now + 2; this._shop(); }
   }
@@ -341,20 +345,30 @@ export class ChampionAI {
     const obj = brain.objective;
     const late = brain.isLateGame();
     let plan;
-    if (obj && brain.participates(this) && this._objectiveViable(obj)) plan = { kind: 'objective', obj };
+    const defLane = brain.defenderLane(this);
+    const epicSetup = obj && obj.setup && (obj.kind === 'dragon' || obj.kind === 'baron');
+    if (defLane && !(obj && obj.kind === 'defend' && obj.all) && !(obj && (obj.end || obj.contest))) plan = { kind: 'defendWave', lane: defLane };
+    else if (obj && brain.participates(this) && this._objectiveViable(obj)) plan = { kind: 'objective', obj };
     else if (late && brain.splitPusher === this) plan = { kind: 'split' };
     else if (this.role === 'jungle') plan = { kind: 'jungle' };
     else if (this._leashCamp()) plan = { kind: 'leash', camp: this._leashCamp() };
     else if (this.role === 'support' && !late) plan = { kind: 'support' };
-    else plan = { kind: 'lane', lane: this.lane || 'mid' };
-    // 支援附近交战中的队友
-    const helpDist = (this.role === 'jungle' || this.role === 'mid' || this.role === 'support' || late) ? 3200 : 1700;
-    if (plan.kind !== 'objective' || plan.obj.kind === 'push') {
+    else plan = { kind: 'lane', lane: brain.laneFor(this) || this.lane || 'mid' };
+    // 支援附近交战中的队友；中后期多人团战时附近队友集结（不在集结布置/防守时离开）
+    const helpDist = (this.role === 'jungle' || this.role === 'mid' || this.role === 'support' || late) ? (late ? 4200 : 3200) : 1700;
+    if ((plan.kind !== 'objective' || plan.obj.kind === 'push') && plan.kind !== 'defendWave' && !epicSetup) {
       const trouble = this._allyInTrouble(helpDist);
+      const fs = brain.fightSpot;
       if (trouble && this.hpPct() > 0.45 && !this.retreating && this._assistWorth(trouble)) plan = { kind: 'assist', ally: trouble.ally, enemy: trouble.enemy, until: now + 6 };
-      else if (this.plan?.kind === 'assist' && now < this.plan.until && this.plan.ally.alive) plan = this.plan;
+      else if (fs && (late || this.role === 'jungle' || this.role === 'mid') && fs.allies + fs.enemies >= 3 && this.hpPct() > 0.45 && !this.retreating && !c.inFountain
+        && Math.hypot(fs.x - c.x, fs.y - c.y) < (late ? 5500 : 3200) && Math.hypot(fs.x - c.x, fs.y - c.y) > 900 && !this.isUnderEnemyTurret(fs.x, fs.y)) {
+        plan = { kind: 'rally', x: fs.x, y: fs.y, until: now + 5 };
+      } else if ((this.plan?.kind === 'assist' && now < this.plan.until && this.plan.ally.alive) || (this.plan?.kind === 'rally' && now < this.plan.until && brain.fightSpot)) plan = this.plan;
     }
+    // 决策滞回：非紧急的计划切换至少保持 3 秒（撤退/回城/防守/目标由各自逻辑优先处理）
+    if (this.plan && plan.kind !== this.plan.kind && now - (this.planSince ?? -99) < 3 && (this.plan.kind === 'lane' || this.plan.kind === 'split') && (plan.kind === 'lane' || plan.kind === 'split')) plan = this.plan;
     if (this.role === 'jungle' && plan.kind === 'jungle') this._evalGank();
+    if (!this.plan || plan.kind !== this.plan.kind) this.planSince = now;
     this.plan = plan;
     this.wantShopGold = c.gold >= this.shopPlanner.nextPurchaseCost();
     this._considerWard();
@@ -418,6 +432,9 @@ export class ChampionAI {
       if (!(this.role === 'mid' || this.role === 'support') || c.level < 4) return false;
       if (this.isUnderEnemyTurret(trouble.enemy.x, trouble.enemy.y)) return false;
     }
+    // 对线期 ADC：只帮身边的辅助，不离线远距离支援（发育优先）；辅助在 ADC 在线时不远离（避免 ADC 1v2）
+    if (this._laningPhase() && this.role === 'adc' && d > 1300) return false;
+    if (this._laningPhase() && this.role === 'support' && d > 1800 && this._adcInLane() && ally.role !== 'adc') return false;
     return true;
   }
 
@@ -442,11 +459,22 @@ export class ChampionAI {
     return c.hp - incoming * ttk > c.maxHp * 0.08;
   }
 
+  _campLock() {
+    const c = this.champ;
+    const t = this.target;
+    if (!t || t.type !== 'monster' || !t.alive || t.epic) return false;
+    if (this.hpPct() < 0.14) return false;
+    if (this.enemies.length && this.enemies[0].d < 1500) return false;
+    if (c.distTo(t) > 700) return false;
+    // 野怪已被打掉不少 / 仇恨在我身上：继续
+    return t.aggroTarget === c && (t.hp < t.maxHp * 0.6 || this.hpPct() > 0.22);
+  }
+
   _objectiveViable(obj) {
     if (this.hpPct() < 0.3 && obj.kind !== 'defend') return false;
     if (obj.kind === 'dragon' || obj.kind === 'baron' || obj.kind === 'herald') {
       if (!obj.camp) return false;
-      if (!this.brain.campUp(obj.camp) && this.brain.campMonsters(obj.camp).length === 0) return false;
+      if (!this.brain.campUp(obj.camp) && this.brain.campMonsters(obj.camp).length === 0 && !obj.setup) return false;
     }
     return true;
   }
@@ -513,18 +541,23 @@ export class ChampionAI {
     this._useCleanse(d);
     // 被防御塔攻击：立即撤出（除非确定击杀）
     if (d.turretAggro && d.underTurret && !this._diveWorth()) { this._escapeTurret(); return; }
+    // 兵线被清 / 塔下没有我方小兵掩护：主动撤出敌塔射程（不单独抗塔）
+    if (d.underTurret && !this.diving && !this._diveWorth()) {
+      const tt = this._enemyTurretAt(c.x, c.y);
+      if (tt && !this._towerCovered(tt) && !(this.engaged && this.engaged.target?.alive && this._diveWorth())) { this._escapeTurret(); return; }
+    }
     if (this._shouldRetreat(d)) { this._retreat(d); return; }
     const t = this._chooseFight(d);
     if (t) { this._fight(t, d); return; }
     this.engaged = null;
     if (this.mode === 'fighting' || (this.target && this.target.type === 'champion')) this.target = null;
-    // 回城
-    if ((this.recallIntent || this._shouldRecall()) && !this._monsterCommit()) {
+    // 回城（正在清野且野怪仇恨在我身上、附近无敌方英雄、血量未到危险线：先清完营地，不把野怪拉出营地脱战）
+    if ((this.recallIntent || this._shouldRecall()) && !this._monsterCommit() && !this._campLock()) {
       this.recallIntent = true;
       if (this._doRecall()) return;
     }
     // 在泉水：状态回满再出门
-    if (c.inFountain && (this.hpPct() < 0.8 || (this._usesMana() && this.manaPct() < 0.55)) && now > 5) {
+    if (c.inFountain && (this.hpPct() < 0.75 || (this._usesMana() && this.manaPct() < 0.5)) && now > 5) {
       this.mode = 'shopping';
       this._idleJitter(c.x, c.y, 120);
       return;
@@ -533,7 +566,8 @@ export class ChampionAI {
     // 空闲时给 custom 技能机会（切换类、自身增益管理等）
     if (now >= this.nextIdleCast && this.mode !== 'fighting') {
       this.nextIdleCast = now + 0.6;
-      this._useAbilities('idle', this.target);
+      // 对线期辅助在 ADC 身边：不给自定义技能「空闲清线」的机会（避免抢刀）
+      if (!(this.role === 'support' && this._laningPhase() && this._adcInLane())) this._useAbilities('idle', this.target);
     }
   }
 
@@ -553,6 +587,20 @@ export class ChampionAI {
       case 'leash': this._leash(p.camp); return;
       case 'jungle': this._jungle(); return;
       case 'support': this._supportLane(); return;
+      case 'defendWave': {
+        // 回防清线：敌方兵线压到我方塔下
+        this._followLane(p.lane, { push: true });
+        return;
+      }
+      case 'rally': {
+        if (now > p.until) { this.plan = null; break; }
+        this.mode = 'roaming';
+        const fs = this.brain.fightSpot;
+        const tx = fs ? fs.x : p.x, ty = fs ? fs.y : p.y;
+        if (this.isUnderEnemyTurret(tx, ty)) { this.plan = null; break; }
+        this.goTo(tx, ty, { tol: 200 });
+        return;
+      }
       case 'assist': {
         if (now > p.until || !p.ally.alive || p.ally.distTo(c) > 4500) { this.plan = null; break; }
         this.mode = 'roaming';
@@ -570,6 +618,8 @@ export class ChampionAI {
 
   _shouldPushLane(lane) {
     if (this.brain.isLateGame()) return true;
+    // 想回城：先推线再回
+    if (this.pushToRecall && this.hpPct() > 0.3) return true;
     if (this.hpPct() < 0.5) return false;
     return this._laneOpponentAbsent(lane);
   }
@@ -590,12 +640,27 @@ export class ChampionAI {
     for (const a of this.allies) { if (a.d > 1400) break; alliesNear.push(a.u); }
     const underTurret = this.isUnderEnemyTurret(c.x, c.y);
     const turretAggro = now - this.lastTurretHitAt < 1.2 || (underTurret && this._turretTargetingMe());
-    let ratio = Infinity;
+    let ratio = Infinity, ratioDef = Infinity;
     if (enemiesNear.length) {
       const ref = enemiesNear[0];
       const ours = groupStrength([c, ...alliesNear], ref);
       const theirs = groupStrength(enemiesNear, c);
-      let our = ours.power, their = theirs.power;
+      // 正在赶来的队友（1400~2600，且在交战/支援/集结）按半额计入；迷雾中最近 4 秒见过的敌人按 0.6 计入（防止被埋伏）
+      const coming = [];
+      for (const a of this.allies) {
+        if (a.d <= 1400) continue;
+        if (a.d > 2600) break;
+        const m = a.u.controller?.mode;
+        if (m === 'fighting' || m === 'roaming' || m === 'objective' || m === 'pushing') coming.push(a.u);
+      }
+      const hidden = [];
+      for (const [e, st] of this.brain.enemySeen) {
+        if (!e.alive || e.visible[c.team] || now - st.t > 4) continue;
+        if ((st.x - c.x) ** 2 + (st.y - c.y) ** 2 < 1600 * 1600) hidden.push(e);
+      }
+      if (coming.length) { const g = groupStrength(coming, ref); ours.ehp += g.ehp * 0.5; ours.dps += g.dps * 0.5; }
+      if (hidden.length) { const g = groupStrength(hidden, c); theirs.ehp += g.ehp * 0.6; theirs.dps += g.dps * 0.6; }
+      let our = ours.ehp * ours.dps, their = theirs.ehp * theirs.dps;
       const mx = (c.x + ref.x) / 2, my = (c.y + ref.y) / 2;
       const R2 = (TURRET_RANGE + 250) ** 2;
       for (const t of this.world.turrets(1 - c.team)) {
@@ -605,15 +670,21 @@ export class ChampionAI {
         if (t.alive && (t.x - mx) ** 2 + (t.y - my) ** 2 < R2) our += ours.ehp * t.stats.ad * 1.2;
       }
       // 对线期：小兵会响应呼叫支援（我方先动手时敌方小兵全额计入，我方小兵半额）
+      // 防守视角（对方先动手）：我方小兵全额、敌方小兵半额——用于判断是否需要撤退
+      let ourD = our, theirD = their;
       if (this._laningPhase()) {
         const eMin = this.game.queryUnits({ x: c.x, y: c.y, radius: 700, enemyOf: c, types: ['minion'], sort: false }).length;
         const aMin = this.game.queryUnits({ x: ref.x, y: ref.y, radius: 700, allyOf: c, types: ['minion'], sort: false }).length;
         their += theirs.ehp * 13 * eMin;
         our += ours.ehp * 13 * aMin * 0.5;
+        const aMinMe = this.game.queryUnits({ x: c.x, y: c.y, radius: 700, allyOf: c, types: ['minion'], sort: false }).length;
+        theirD += theirs.ehp * 13 * eMin * 0.5;
+        ourD += ours.ehp * 13 * aMinMe;
       }
       ratio = our / Math.max(1, their);
+      ratioDef = ourD / Math.max(1, theirD);
     }
-    return { enemiesNear, alliesNear, threat, lethal: threat >= (c.hp + c.totalShield) * 0.95, ratio, underTurret, turretAggro };
+    return { enemiesNear, alliesNear, threat, lethal: threat >= (c.hp + c.totalShield) * 0.95, ratio, ratioDef, underTurret, turretAggro };
   }
 
   _turretTargetingMe() {
@@ -670,6 +741,9 @@ export class ChampionAI {
     if (this.retreating) {
       if (c.inFountain) { this.retreating = false; return false; }
       if (d.enemiesNear.length === 0 && hp > this.retreatHp + 0.25) { this.retreating = false; return false; }
+      // 危险解除（滞回）：未被英雄攻击、局势不再明显劣势、血量尚可、且已撤出至少 1.5 秒 → 回到兵线
+      if (now - (this.retreatSince ?? -99) > 1.5 && hp > this.retreatHp + 0.1 && !d.lethal && now - (c.lastChampionDamageAt ?? -99) > 2
+        && d.ratioDef * this.engageFactor > 0.8 && d.enemiesNear.length < d.alliesNear.length + 3 && !this.recallIntent) { this.retreating = false; return false; }
       // 追兵残血且可击杀：反打
       if (close && nearest.u.hp / nearest.u.maxHp < 0.15 && comboDamage(c, nearest.u, { window: 1.5 }) > nearest.u.hp * 1.3 && d.ratio > 0.9 && hp > 0.15) { this.retreating = false; return false; }
       return true;
@@ -677,12 +751,23 @@ export class ChampionAI {
     if (hp < this.retreatHp && close) {
       const t = nearest.u;
       if (t.hp / t.maxHp < 0.2 && comboDamage(c, t, { window: 2 }) > t.hp * 1.2 && d.ratio > 0.8) return false;
+      this._retreatWhy = 'lowhp';
       return true;
     }
-    if (hp < this.retreatHp * 0.65 && now - c.lastDamagedAt < 3 && !this._monsterCommit()) return true;
-    if (close && d.lethal && d.ratio < 1.1) return true;
-    if (close && nearest.d < 950 && d.ratio * this.engageFactor < 0.45) return true;
-    if (d.enemiesNear.length >= d.alliesNear.length + 3) return true;
+    if (hp < this.retreatHp * 0.65 && now - c.lastDamagedAt < 3 && !this._monsterCommit()) { this._retreatWhy = 'lowhp2'; return true; }
+    if (close && d.lethal && d.ratio < 1.1) { this._retreatWhy = 'lethal'; return true; }
+    if (close && nearest.d < 950 && d.ratioDef * this.engageFactor < 0.45) {
+      // 对线期：对方没有在攻击我且我不在其威胁距离内 → 只是「谨慎站位」（后撤一段继续补刀），不整体撤退回塔
+      const u = nearest.u;
+      const reach = u.stats.attackRange + u.radius + c.radius + 260;
+      if (this._laningPhase() && this.plan?.kind !== 'objective' && now - (c.lastChampionDamageAt ?? -99) > 1.8 && nearest.d > reach && d.ratioDef * this.engageFactor > 0.18 && !d.lethal) {
+        this.cautionUntil = now + 2.5;
+        return false;
+      }
+      this._retreatWhy = 'ratio';
+      return true;
+    }
+    if (d.enemiesNear.length >= d.alliesNear.length + 3) { this._retreatWhy = 'outnumber'; return true; }
     return false;
   }
 
@@ -690,6 +775,7 @@ export class ChampionAI {
     const c = this.champ;
     const now = this.game.time;
     this.mode = 'retreating';
+    if (!this.retreating) this.retreatSince = now;
     this.retreating = true;
     this.target = null;
     this.engaged = null;
@@ -703,12 +789,27 @@ export class ChampionAI {
       // 脱离危险：状态尚可就回到兵线（对线期有药水时更能坚持），否则回城
       const laning = this._laningPhase();
       const pressing = this.plan?.kind === 'objective' && this.brain.pressing();
-      const needHp = pressing ? 0.33 : laning ? (findPotionSlot(c) >= 0 ? 0.3 : 0.4) : 0.6;
-      if (this.hpPct() < needHp || (!pressing && this.wantShopGold && this.hpPct() < (laning ? 0.5 : 0.75)) || (this._usesMana() && this.manaPct() < (pressing ? 0.1 : 0.2))) {
+      const needHp = pressing ? 0.33 : laning ? (findPotionSlot(c) >= 0 ? 0.22 : 0.3) : 0.55;
+      const shopHp = laning ? (c.gold >= this.shopPlanner.nextPurchaseCost() + 300 ? 0.4 : 0.3) : 0.7;
+      if (this.hpPct() < needHp || (!pressing && this.wantShopGold && this.hpPct() < shopHp) || (this._usesMana() && this.manaPct() < (pressing ? 0.1 : 0.15))) {
         this.recallIntent = true;
+        this._recallWhy = 'retreat';
         if (this._doRecall()) return;
       } else {
         this.retreating = false;
+        return;
+      }
+    }
+    // 对线期因局势（非残血）撤退：沿兵线后撤一段拉开距离即可，不必退回塔后（减少漏刀）
+    const lane = this.plan?.kind === 'lane' ? this.plan.lane : (this.plan?.kind === 'support' ? 'bot' : null);
+    if (lane && this._laningPhase() && this.hpPct() > 0.45 && (this._retreatWhy === 'ratio' || this._retreatWhy === 'lethal')) {
+      const own = this.world.frontStructure(c.team, lane);
+      const w = this.world;
+      const myF = w.toF(c.team, lane, w.project(lane, c.x, c.y));
+      const ownF = own ? w.toF(c.team, lane, w.structureS(own)) : 0;
+      if (w.lastProjDist < 900 && myF - 700 > ownF - 250) {
+        const p = this._laneBackPoint(lane, 700);
+        this.goTo(p.x, p.y, { force: true, tol: 120 });
         return;
       }
     }
@@ -742,7 +843,7 @@ export class ChampionAI {
   _shouldRecall() {
     const c = this.champ;
     const now = this.game.time;
-    if (c.inFountain) { this.recallIntent = false; return false; }
+    if (c.inFountain) { this.recallIntent = false; this.pushToRecall = false; return false; }
     if (now < 100) return false;
     const hp = this.hpPct();
     const p = this.plan;
@@ -750,22 +851,48 @@ export class ChampionAI {
     // 乘胜推进/残局推家：状态尚可就不回城
     if (p?.kind === 'objective' && this.brain.pressing() && hp > 0.33 && !(this._usesMana() && this.manaPct() < 0.1)) return false;
     const laning = this._laningPhase();
-    const lowHp = laning ? Math.max(0.2, this.retreatHp - (findPotionSlot(c) >= 0 ? 0.08 : 0)) : this.retreatHp + 0.08;
-    if (hp < lowHp) return true;
-    if (this._usesMana() && this.manaPct() < 0.12 && hp < 0.9) return true;
+    // 打野：前期清野回血手段多（惩戒/野怪 Buff），阈值更低，尽量整片清完再回
+    const jgLow = this.role === 'jungle' && now < 14 * 60 ? 0.28 : this.retreatHp + 0.08;
+    const lowHp = laning ? Math.max(0.2, this.retreatHp - 0.04 - (findPotionSlot(c) >= 0 ? 0.08 : 0)) : jgLow;
+    if (hp < lowHp) { this._recallWhy = 'hp'; return true; }
+    if (this._usesMana() && this.manaPct() < 0.1 && hp < 0.9) { this._recallWhy = 'mana'; return true; }
     const next = this.shopPlanner.nextPurchaseCost();
+    // 非紧急回城（买装备/状态一般）：对线期先把兵线推过去再回（推线回城），超时则直接回
+    let want = false;
     if (this.wantShopGold) {
       if (laning) {
         // 对线期：攒够一件大件组件再回（或状态不佳 + 买得起）
-        if ((hp < 0.5 && c.gold >= next) || c.gold >= Math.max(next + 500, 1250) || (this._usesMana() && this.manaPct() < 0.2)) return true;
-      } else if (hp < 0.6 || c.gold >= next + 450 || (this._usesMana() && this.manaPct() < 0.3)) return true;
+        if ((hp < 0.42 && c.gold >= next) || c.gold >= Math.max(next + 500, 1250) || (this._usesMana() && this.manaPct() < 0.18)) want = true;
+      } else if (hp < 0.6 || c.gold >= next + 450 || (this._usesMana() && this.manaPct() < 0.3)) want = true;
     }
-    if (c.gold > 2800) return true;
+    if (c.gold > 2800) want = true;
+    if (want) {
+      if (!laning || this.role === 'jungle' || this.plan?.kind !== 'lane') { this._recallWhy = 'shop'; return true; }
+      if (!this.pushToRecall) { this.pushToRecall = true; this.pushToRecallSince = now; }
+      if (this._waveCrashed(this.plan.lane || this.lane) || now - this.pushToRecallSince > 22 || hp < 0.3) { this._recallWhy = 'shop-crash'; return true; }
+      return false;
+    }
+    this.pushToRecall = false;
     if (this.role === 'support' && !this.brain.isLateGame()) {
       const adc = this._adc();
       if (adc && adc.isRecalling && adc.distTo(c) < 1300 && (hp < 0.8 || c.gold > 800)) return true;
     }
     return false;
+  }
+
+  // 兵线已推过去（敌方兵线被清、己方兵线在敌塔附近 / 身边没有敌方小兵）：适合回城
+  _waveCrashed(lane) {
+    const c = this.champ;
+    if (!lane) return true;
+    const near = this.game.queryUnits({ x: c.x, y: c.y, radius: 1000, enemyOf: c, types: ['minion'], sort: false }).length;
+    const wv = this.brain.waves[lane];
+    const w = this.world;
+    const et = w.frontStructure(1 - c.team, lane);
+    if (wv.allyFront != null && et) {
+      const etF = w.toF(c.team, lane, w.structureS(et));
+      if (wv.allyFront > etF - TURRET_RANGE - 150 && near <= 2) return true;
+    }
+    return near === 0 && (wv.enemyFront == null || wv.enemyNearFront <= 1);
   }
 
   _doRecall() {
@@ -808,11 +935,22 @@ export class ChampionAI {
     const cur = this.engaged?.target;
     const maxR = cur ? Math.max(engageR, 1300) : engageR;
     let best = null, bs = -Infinity;
+    const focus = this.brain.focus;
+    const noChase = this._noChase;
+    // 新手：目标选择常失误（随机挑一个）
+    const sloppy = this.skill < 0.3 && this.game.rng() < 0.25;
     for (const e of this.enemies) {
       if (e.d > maxR) break;
       const u = e.u;
       if (u.untargetable || !this.reactable(u)) continue;
-      const s = targetScore(c, u, { current: cur, range: c.stats.attackRange + 200 });
+      if (noChase && noChase.u === u && now < noChase.until && u !== cur) continue;
+      let s = targetScore(c, u, { current: cur, range: c.stats.attackRange + 200 });
+      // 团队集火（难度越高越会跟集火）
+      if (u === focus && e.d < c.stats.attackRange + 450) s *= 1.15 + this.skill * 0.45;
+      // 保护：优先打进场贴脸的刺客/战士（正在攻击我或我方 C 位）
+      const diver = u.stats.attackRange < 300 && (e.d < 450 || this._divingOnCarry(u));
+      if (diver && (c.stats.attackRange >= 300 || this.role === 'support')) s *= 1.35 + this.skill * 0.3;
+      if (sloppy) s *= 0.5 + this.game.rng();
       if (s > bs) { bs = s; best = u; }
     }
     if (!best) return null;
@@ -821,6 +959,19 @@ export class ChampionAI {
     const tEhp = best.hp + (best.totalShield || 0);
     const killable = combo >= tEhp * 1.05;
     const ratio = d.ratio * this.engageFactor;
+    // 放弃追击：追了 3 秒以上没拉近距离且杀不掉 / 目标逃进敌方野区深处或迷雾 → 放弃（新手常追太深）
+    if (cur === best && this.engaged && !killable && this.skill >= 0.3) {
+      const dist = c.distTo(best);
+      const reach = c.stats.attackRange + c.radius + best.radius + 120;
+      if (dist > reach && now - (this.engaged.gainAt ?? this.engaged.since) > 3 && this.plan?.kind !== 'objective') {
+        this._noChase = { u: best, until: now + 4 };
+        return null;
+      }
+      if (dist > reach && this._deepEnemyJungle(best.x, best.y) && d.alliesNear.length < 2) {
+        this._noChase = { u: best, until: now + 4 };
+        return null;
+      }
+    }
     // 越塔：只在确定击杀、塔未锁定我方英雄、自身血量健康时
     if (this.isUnderEnemyTurret(best.x, best.y)) {
       const turret = this._enemyTurretAt(best.x, best.y);
@@ -838,25 +989,41 @@ export class ChampionAI {
       const hitBy = recentlyHit && c.lastChampionDamager === best;
       if (cur === best) {
         const len = now - (this.engaged?.since ?? now);
-        if (len < 2.5 + this.params.aggression * 1.5 && ratio > 1.0 && hp > 0.42) return best;
-        if (hitBy && ratio > 1.5 && hp > 0.45 && c.inAttackRange(best, 40)) return best;
-        this.tradeCdUntil = now + 3.5 + this.game.rng() * 4 * (1.2 - this.params.aggression);
+        // 换血时长：短换（1.8~3 秒）后拉开；困难更会见好就收
+        if (len < 1.8 + this.params.aggression * 1.4 - this.skill * 0.4 && ratio > 1.0 && hp > 0.45) return best;
+        if (hitBy && ratio > 1.5 && hp > 0.5 && c.inAttackRange(best, 40)) return best;
+        this.tradeCdUntil = now + 4.5 + this.game.rng() * 5 * (1.2 - this.params.aggression);
+        this._afterTrade = now;
+        const lane = this.plan?.kind === 'lane' ? this.plan.lane : (this.plan?.kind === 'support' ? 'bot' : null);
+        if (lane) this._afterHarass(lane);
         return null;
       }
       if (now < this.tradeCdUntil) {
-        if (hitBy && ratio > 1.5 && hp > 0.5 && c.inAttackRange(best, 40)) return best;
+        if (hitBy && ratio > 1.6 && hp > 0.55 && c.inAttackRange(best, 40)) return best;
         return null;
       }
-      // 主动换血：目标附近敌方小兵不多（否则会被整波小兵集火）
+      // 主动换血：只在明显有利时（对面关键技能冷却 / 血量劣势 / 小兵少），每 2.5 秒评估一次，概率随激进度
       const minionsAtTarget = this.game.queryUnits({ x: best.x, y: best.y, radius: 800, enemyOf: c, types: ['minion'], sort: false }).length;
-      if (ratio > 1.8 && hp > 0.55 && minionsAtTarget <= 2) return best;
-      if (best.hp / best.maxHp < 0.3 && ratio > 1.1 && hp > 0.4 && minionsAtTarget <= 3) return best;
-      if (hitBy && ratio > 1.15 && hp > 0.5 && hp >= best.hp / best.maxHp - 0.05) return best;
+      if (now >= (this._tradeRollAt || 0)) {
+        this._tradeRollAt = now + 2.5;
+        this._tradeRoll = this.game.rng() < 0.25 + this.params.aggression * 0.45;
+      }
+      const theirCd = this._enemyKeyCdDown(best);
+      // 对方正在补刀（前摇打小兵）：经典换血窗口（困难会抓）
+      const theyFarm = this.skill >= 0.6 && best.attackState?.target?.type === 'minion' && c.distTo(best) < c.stats.attackRange + 250;
+      // 困难：只打高质量换血（对方技能冷却 / 血量明显落后 / 对方补刀时）
+      const strong = this.skill >= 0.8 ? (theirCd || best.hp / best.maxHp < hp - 0.2 || theyFarm) : true;
+      const favored = ((ratio > 2.2 && strong) || (ratio > 1.6 && theirCd) || (ratio > 1.4 && theyFarm)) && hp > 0.6 && hp >= best.hp / best.maxHp - 0.05;
+      if (this._tradeRoll && favored && minionsAtTarget <= 2) return best;
+      if (best.hp / best.maxHp < 0.3 && ratio > 1.2 && hp > 0.45 && minionsAtTarget <= 3 && this._tradeRoll) return best;
+      if (hitBy && ratio > 1.3 && hp > 0.55 && hp >= best.hp / best.maxHp && minionsAtTarget <= 3) return best;
       return null;
     }
     if (cur === best && (ratio > 0.75 || killable)) return best;
     if (killable && ratio > 0.55) return best;
     if (this.gank && this.gank.target === best && ratio > 0.7) return best;
+    // 困难：主动开团前等关键技能冷却好（被打/能击杀除外）
+    if (this.skill >= 0.8 && !recentlyHit && this._readiness() < 0.55 && ratio < 1.6) return null;
     if (ratio > 1.12) return best;
     if (recentlyHit && ratio > 0.85) return best;
     // 保护队友：敌人正在攻击我方 C 位
@@ -869,13 +1036,64 @@ export class ChampionAI {
     return null;
   }
 
+  // 敌方关键技能（按记录的冷却估计）是否大多在冷却中：换血窗口
+  _enemyKeyCdDown(e) {
+    const cd = this.brain.enemyCooldowns(e);
+    if (!cd) return false;
+    const now = this.game.time;
+    let down = 0, n = 0;
+    for (const slot of ['Q', 'W', 'E']) {
+      const ab = e.abilities?.[slot];
+      if (!ab || ab.rank <= 0) continue;
+      n++;
+      if ((cd[slot] ?? 0) > now + 1.5) down++;
+    }
+    return n > 0 && down * 2 >= n;
+  }
+
+  // 敌方近战是否正贴着我方 C 位（ADC/中单）
+  _divingOnCarry(u) {
+    for (const a of this.allies) {
+      if (a.d > 1100) break;
+      const r = a.u.role;
+      if ((r === 'adc' || r === 'mid') && a.u.distTo(u) < 420) return true;
+    }
+    return false;
+  }
+
+  // 是否在敌方野区深处（离所有兵线较远、靠近敌方泉水一侧）
+  _deepEnemyJungle(x, y) {
+    const w = this.world;
+    let dl = Infinity;
+    for (const lane of ['top', 'mid', 'bot']) { w.project(lane, x, y); dl = Math.min(dl, w.lastProjDist); }
+    if (dl < 1100) return false;
+    const fe = this.world.fountains[1 - this.champ.team], fo = this.world.fountains[this.champ.team];
+    return Math.hypot(fe.x - x, fe.y - y) < Math.hypot(fo.x - x, fo.y - y) * 0.85;
+  }
+
+  // 关键技能就绪比例（困难会卡技能冷却进场）
+  _readiness() {
+    const c = this.champ;
+    let n = 0, r = 0;
+    for (const slot of ['Q', 'W', 'E', 'R']) {
+      const ab = c.abilities[slot];
+      if (!ab || ab.rank <= 0) continue;
+      const w = slot === 'R' ? 1.5 : 1;
+      n += w;
+      if (ab.ready || ab.cdRemaining < 1.2) r += w;
+    }
+    return n > 0 ? r / n : 1;
+  }
+
   _fight(t, d) {
     const c = this.champ;
     const now = this.game.time;
     this.mode = 'fighting';
     this.target = t;
     this.lastFightAt = now;
-    if (!this.engaged || this.engaged.target !== t) this.engaged = { target: t, since: now };
+    if (!this.engaged || this.engaged.target !== t) this.engaged = { target: t, since: now, minD: Infinity, gainAt: now };
+    const dT = c.distTo(t);
+    if (dT < this.engaged.minD - 40 || c.inAttackRange(t, 30)) { this.engaged.minD = dT; this.engaged.gainAt = now; }
     this.lhWatch = null;
     this.gank = null;
     this._offensiveSummoners(t, d);
@@ -1084,8 +1302,9 @@ export class ChampionAI {
     }
     // 补刀微操：对线/推线时每 2 tick 扫描一次（辅助在 ADC 身边时不补）
     if ((this.mode === 'laning' || this.mode === 'pushing') && !(this.role === 'support' && this._adcInLane())) {
+      // 困难每 tick 扫描；其余每 2 tick（有盯防目标时每 tick）
       this._lhTick = ((this._lhTick || 0) + 1) & 1;
-      if (this._lhTick === 0 || this.lhWatch) this._microLastHit();
+      if (this._lhTick === 0 || this.lhWatch || this.skill >= 0.9) this._microLastHit();
     }
     // 打野：交战/打龙时盯惩戒抢怪
     if (this.role === 'jungle' && (this.mode === 'fighting' || this.mode === 'objective')) {
@@ -1099,6 +1318,11 @@ export class ChampionAI {
   goTo(x, y, { force = false, tol = 90 } = {}) {
     const c = this.champ;
     const now = this.game.time;
+    // 远距离赶路：路线经过敌方防御塔射程时绕行（避免「进塔→被迫撤出→再进塔」的原地抖动）
+    if (!force && !this.diving && (Math.abs(c.x - x) + Math.abs(c.y - y)) > 900 && !this.isUnderEnemyTurret(x, y)) {
+      const dt = this._turretDetour(x, y);
+      if (dt) { x = dt.x; y = dt.y; tol = Math.min(tol, 80); }
+    }
     if (!force && c.attackState) return false;
     if (!force && this.dodger.active && now < this.dodger.active.until) return false;
     if (c.channel && !c.isRecalling && !c.channel.canMove) return false;
@@ -1110,6 +1334,42 @@ export class ChampionAI {
     c.moveTo(x, y);
     this._lastMove = { x, y, t: now };
     return true;
+  }
+
+  // 绕塔点：离我最近的敌塔若挡在前进方向上（线段穿过其射程），返回塔射程外、朝目标一侧的绕行点
+  _turretDetour(x, y) {
+    const c = this.champ;
+    const R = TURRET_RANGE + c.radius + 160;
+    let best = null, bd = Infinity;
+    for (const t of this.world.turrets(1 - c.team)) {
+      if (!t.alive) continue;
+      const d = Math.hypot(t.x - c.x, t.y - c.y);
+      if (d < bd) { bd = d; best = t; }
+    }
+    if (!best || bd > R + 1200 || bd < TURRET_RANGE * 0.6) return null;
+    // 我方小兵掩护时允许正常通过
+    if (this._towerCovered(best)) return null;
+    // 线段 c→(x,y) 到塔的最近距离
+    const dx = x - c.x, dy = y - c.y;
+    const L2 = dx * dx + dy * dy || 1;
+    let u = ((best.x - c.x) * dx + (best.y - c.y) * dy) / L2;
+    u = Math.max(0, Math.min(1, u));
+    const px = c.x + dx * u - best.x, py = c.y + dy * u - best.y;
+    if (Math.hypot(px, py) > R - 40) return null;
+    // 从塔指向我的方向，向目标一侧旋转，取射程外的点
+    const ax = c.x - best.x, ay = c.y - best.y;
+    const base = Math.atan2(ay, ax);
+    const cross = ax * dy - ay * dx;
+    const sgn = cross >= 0 ? 1 : -1;
+    const nav = this.game.nav;
+    for (const k of [0.75, 1.1, 0.45, 1.45]) {
+      for (const sg of [sgn, -sgn]) {
+        const a = base + sg * k;
+        const qx = best.x + Math.cos(a) * (R + 60), qy = best.y + Math.sin(a) * (R + 60);
+        if (nav.isWalkable(qx, qy)) return { x: qx, y: qy };
+      }
+    }
+    return null;
   }
 
   attack(u) {

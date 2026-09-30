@@ -24,6 +24,20 @@ export const AbilityMixin = {
   _useAbilities(ctx, target = null) {
     const c = this.champ;
     if (c.castLock > 0 || !c.canCast() || !c.alive) return false;
+    // 纯清线 / 空闲：对英雄自定义技能屏蔽敌方英雄（是否消耗由 _tryHarass/交战决定，避免乱放技能耗蓝）；
+    // 推线时法力不足以消耗也屏蔽
+    const mask = ctx === 'farm' || ctx === 'idle' || (ctx === 'push' && this._usesMana() && this.manaPct() < this.harassMana);
+    if (mask) {
+      const saved = this.target;
+      this._maskEnemies = true;
+      if (saved && saved.type === 'champion') this.target = null;
+      try { return this._useAbilitiesInner(ctx, target); } finally { this._maskEnemies = false; if (this.target === null) this.target = saved; }
+    }
+    return this._useAbilitiesInner(ctx, target);
+  },
+
+  _useAbilitiesInner(ctx, target) {
+    const c = this.champ;
     const now = this.game.time;
     this.castContext = ctx;
     for (const slot of this._slotOrder()) {
@@ -92,7 +106,13 @@ export const AbilityMixin = {
       if (d <= melee && !hint.when && hint.targeting !== 'self') return false;
       if (this.isUnderEnemyTurret(target.x, target.y) && !this.diving) return false;
     }
-    if (kind === 'cc' && target.isHardCCd?.() && target.ccRemaining?.('stun') > 0.5) return false; // 不叠控
+    // 控制链不重叠：目标仍被硬控时，等控制快结束（技能生效前后衔接）再放；新手不讲究
+    if (kind === 'cc' && this.skill >= 0.3) {
+      const rem = this._hardCcLeft(target);
+      const d = this.champ.distTo(target);
+      const land = (hint.delay ?? ab.castTime ?? 0.25) + (hint.speed > 0 ? d / hint.speed : 0);
+      if (rem > land + 0.15) return false;
+    }
     if (kind === 'aoe') return this._castAoe(ab, hint, ctx, target);
     return this._castOffensive(ab, hint, target);
   },
@@ -191,16 +211,26 @@ export const AbilityMixin = {
     return n;
   },
 
-  // 大招是否值得交
+  // 目标剩余硬控时间
+  _hardCcLeft(u) {
+    if (!u.ccRemaining) return u.isHardCCd?.() ? 0.5 : 0;
+    let m = 0;
+    for (const t of ['stun', 'charm', 'fear', 'taunt', 'sleep', 'suppress', 'airborne', 'root']) m = Math.max(m, u.ccRemaining(t) || 0);
+    return m;
+  },
+
+  // 大招是否值得交：能命中多人（目标周围的敌人）、能斩杀、或自己残血拼命；新手常随手乱交
   _worthUlt(ab, hint, target) {
     if (hint.when) return true;
     const c = this.champ;
-    if (target.hp / target.maxHp < 0.55) return true;
+    if (this.skill < 0.3 && this.game.rng() < 0.3) return true;
+    const r = Math.max(450, (hint.radius || 0) * 1.3);
     let near = 0;
-    for (const e of this.enemies) if (e.d < 1200) near++;
-    if (near >= 2) return true;
-    if (comboDamage(c, target) >= effectiveHp(target, damageTypeOf(c), c) * 0.8) return true;
-    if (this.hpPct() < 0.4 && this.mode === 'fighting') return true;
+    for (const e of this.enemies) if (!e.u.untargetable && e.u.distTo(target) < r) near++;
+    if (near >= 2 && this.danger && this.danger.enemiesNear.length >= 2) return true;
+    if (comboDamage(c, target) >= effectiveHp(target, damageTypeOf(c), c) * 0.85) return true;
+    if (target.hp / target.maxHp < 0.4) return true;
+    if (this.hpPct() < 0.35 && this.mode === 'fighting') return true;
     return false;
   },
 
@@ -291,31 +321,41 @@ export const AbilityMixin = {
   _castFarm(ab, hint, ctx, target) {
     const c = this.champ;
     if (ab.slot === 'R') return false;
-    const manaReq = ctx === 'jungle' ? 0.22 : ctx === 'push' ? 0.45 : 0.7;
+    // 法力阈值：打野/推线（急推、残局）更低；对线补刀更保守（难度越高越会留蓝）
+    const rush = ctx === 'push' && (this.pushToRecall || this.brain.isLateGame());
+    const manaReq = ctx === 'jungle' ? 0.22 : ctx === 'push' ? (rush ? 0.3 : 0.45) : 0.55 + this.skill * 0.1;
     if (this._usesMana() && this.manaPct() < manaReq) return false;
     const tg = hint.targeting;
     const range = abilityRange(ab, hint);
     const radius = hint.radius || (tg === 'self' || tg === 'none' ? range : 220) || 220;
     let aim = target;
     if (ctx === 'farm' || ctx === 'push') {
-      // 找小兵最密集处
+      // 找小兵最密集处；统计命中数与可击杀数
       const reach = (tg === 'self' || tg === 'none') ? radius : range + radius * 0.5;
       const mins = this.game.queryUnits({ x: c.x, y: c.y, radius: reach, enemyOf: c, types: ['minion'], targetableBy: c, sort: false });
-      const need = ctx === 'push' ? 3 : 4;
+      const need = ctx === 'push' ? 3 : 3;
       if (mins.length < need) return false;
+      const dmgOf = (m) => abilityDamage(c, ab, m);
+      const scoreSet = (arr) => {
+        let hit = 0, kill = 0;
+        for (const m of arr) { hit++; if (m.hp <= dmgOf(m) * 0.95) kill++; }
+        return { hit, kill };
+      };
+      // 对线期清线（farm）：至少收掉 2 个小兵，或命中 4 个以上且法力充足
+      const good = (s) => (ctx === 'push' ? s.hit >= need : (s.kill >= 2 || (s.hit >= 4 && (!this._usesMana() || this.manaPct() > 0.75))));
       if (tg === 'self' || tg === 'none') {
-        let n = 0;
-        for (const m of mins) if (c.distTo(m) <= radius + m.radius) n++;
-        if (n < need) return false;
+        const inR = mins.filter((m) => c.distTo(m) <= radius + m.radius);
+        if (!good(scoreSet(inR))) return false;
         return this.castSelf(ab.slot).ok;
       }
-      let best = null, bn = 0;
+      let best = null, bs = null, bv = -1;
       for (const m of mins) {
-        let n = 0;
-        for (const o of mins) if ((o.x - m.x) ** 2 + (o.y - m.y) ** 2 <= radius * radius) n++;
-        if (n > bn) { bn = n; best = m; }
+        const grp = mins.filter((o) => (o.x - m.x) ** 2 + (o.y - m.y) ** 2 <= radius * radius);
+        const s = scoreSet(grp);
+        const v = s.hit + s.kill * 1.5;
+        if (v > bv) { bv = v; best = m; bs = s; }
       }
-      if (!best || bn < need - 1) return false;
+      if (!best || !good(bs)) return false;
       aim = best;
       if (this.isUnderEnemyTurret(aim.x, aim.y) && !this._towerCovered(this._enemyTurretAt(aim.x, aim.y))) return false;
     }
